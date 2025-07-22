@@ -1,0 +1,10 @@
+# Ignora tutto
+*
+
+# Eccezioni
+!.gitignore
+!KeyPoint_Detection/
+!KeyPoint_Detection/**
+
+# Eccezioni delle eccezioni ;)
+KeyPoint_Detection/YOLO_dataset/
