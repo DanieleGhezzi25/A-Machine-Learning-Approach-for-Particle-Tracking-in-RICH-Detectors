@@ -5,6 +5,11 @@
 !.gitignore
 !KeyPoint_Detection/
 !KeyPoint_Detection/**
+!UNet/
+!UNet/**
 
 # Eccezioni delle eccezioni ;)
 KeyPoint_Detection/YOLO_dataset/
+UNet/UNet_dataset/
+
+**/*.pth

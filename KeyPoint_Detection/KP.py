@@ -10,7 +10,7 @@ from sklearn.metrics import auc
 ##########################
 # FUNZIONE 1: INFERENZA SU IMMAGINE SINGOLA
 ##########################
-def inference(image_path, model_path, show_image=False, save_image=False, output_path='inference.jpg'):
+def inference(image_path, model_path, confidence=0.5, show_image=False, save_image=False, output_path='inference.jpg'):
     """
     Esegue l'inferenza su una singola immagine con un modello YOLO e opzionalmente visualizza/salva il risultato.
 
@@ -32,7 +32,7 @@ def inference(image_path, model_path, show_image=False, save_image=False, output
     if not os.path.exists(model_path):
         raise ValueError(f"Il modello non esiste: {model_path}")
 
-    results = model.predict(source=image, conf=0.5, save=False)
+    results = model.predict(source=image, conf=confidence, save=False)
     if not results:
         raise ValueError("Nessun risultato trovato nell'inferenza.")
 
@@ -313,10 +313,6 @@ def plot_F1_surface(pck_thresholds, conf_thresholds, F1_matrix):
 
     # Wireframe della griglia sottostante (valori x,y)
     ax.plot_wireframe(X, Y, np.min(F1_matrix)*np.ones_like(F1_matrix), color='gray', linewidth=0.5, rstride=1, cstride=1)
-
-    # Impostazione degli assi con ticks espliciti (per valori discreti)
-    ax.set_xticks(pck_thresholds)
-    ax.set_yticks(conf_thresholds)
     
     # Label assi con valori arrotondati per chiarezza
     ax.set_xlabel('PCK Threshold (px)')
