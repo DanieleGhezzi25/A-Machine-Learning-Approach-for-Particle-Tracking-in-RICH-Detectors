@@ -11,5 +11,6 @@
 # Eccezioni delle eccezioni ;)
 KeyPoint_Detection/YOLO_dataset/
 UNet/UNet_dataset/
+UNet/Models/Model_20000_5000_160_180/output_inference
 
 **/*.pth
