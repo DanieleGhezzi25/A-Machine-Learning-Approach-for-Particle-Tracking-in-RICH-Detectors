@@ -142,7 +142,7 @@ class UNet(nn.Module):
 
 
 '''
-    Modulo per implementazione di UMNet aventi soft attention gates.
+    Modulo per implementazione di UNet aventi soft attention gates.
     
     Questi moduli sono utilizzati per migliorare la capacità del modello di focalizzarsi
     su regioni rilevanti dell'immagine durante il processo di decodifica.
@@ -281,7 +281,7 @@ class HeatmapDataset(Dataset):
         self.label_dir = label_dir
         self.image_size = image_size
 
-        self.image_filenames = sorted([f for f in os.listdir(image_dir) if f.lower().endswith('.png')]) # lista ordinata dei file .png
+        self.image_filenames = sorted([f for f in os.listdir(image_dir) if f.lower().endswith('.npy')]) # lista ordinata dei file .npy
 
         self.transform = transforms.Compose([
             transforms.ToTensor() # Converti le immagini in tensori con valori tra 0 e 1
@@ -311,17 +311,21 @@ class HeatmapDataset(Dataset):
         tuple
             Una tupla contenente l'immagine e la heatmap (o maschera) come tensori PyTorch.
         '''
-        img_path = os.path.join(self.image_dir, self.image_filenames[idx])
-        label_path = os.path.join(self.label_dir, self.image_filenames[idx])
 
-        image = Image.open(img_path).convert("L") # Converti in scala di grigi
-        label = Image.open(label_path).convert("L") # Converti in scala di grigi
+        fname = self.image_filenames[idx]
 
-        image = image.resize(self.image_size) # Ridimensiona l'immagine
-        label = label.resize(self.image_size) # Ridimensiona la heatmap
+        image = np.load(os.path.join(self.image_dir, fname))  # H x W
+        label = np.load(os.path.join(self.label_dir, fname))  # H x W
 
-        image = self.transform(image) # Converti in tensore
-        label = self.transform(label) # Converti in tensore
+        # Espandi a 1 canale (1 x H x W)
+        image = np.expand_dims(image, axis=0)
+        label = np.expand_dims(label, axis=0)
+
+        image = torch.from_numpy(image).float()
+        label = torch.from_numpy(label).float()
+
+        # if self.transform:
+        #     image, label = self.transform(image, label)
 
         return image, label
 
@@ -365,7 +369,28 @@ def get_dataloaders(data_dir, batch_size=8, image_size=(800, 800)):
 
 
 
-def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5):
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, preds, targets):
+        preds = torch.sigmoid(preds)  # sigmoid qui dentro, perché usi BCEWithLogits fuori
+        preds = preds.contiguous().view(preds.size(0), -1)
+        targets = targets.contiguous().view(targets.size(0), -1)
+
+        intersection = (preds * targets).sum(dim=1)
+        dice = (2. * intersection + self.smooth) / (
+            preds.sum(dim=1) + targets.sum(dim=1) + self.smooth)
+
+        return 1 - dice.mean()
+
+
+
+
+
+def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5, binary_threshold=0.97):
     '''
     Funzione per addestrare il modello U-Net.
     Parameters
@@ -397,7 +422,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     - Il modello viene salvato se la loss di validazione migliora rispetto alla migliore loss precedente.
     - tqdm è una libreria che fornisce una barra di avanzamento per i loop, utile per monitorare l'addestramento.
     - pos_weight = se la rete commette un errore quando prevede un pixel che dovrebbe essere positivo (cioè, un pixel del centro 
-      del cerchio nella tua heatmap), quel costo dell'errore viene moltiplicato per il valore di pos_weight.
+      del cerchio nella heatmap), quel costo dell'errore viene moltiplicato per il valore di pos_weight.
       Il suo scopo principale è quello di affrontare il problema dello squilibrio di classi (class imbalance), 
       dove i pixel di "sfondo" (negativi) sono numericamente molto più abbondanti dei pixel di "interesse" (positivi).
       Qui è calcolata come "area dei pixel negativi / somma totale delle intensità dei pixel positivi" (è stata fatta una stima con area gaussiana 2pi*sigma**2).
@@ -405,7 +430,8 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     
     # Imposta il dispositivo (GPU o CPU)
     model = model.to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([150], device=device)) 
+    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([275], device=device)) 
+    dice_loss = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
 
@@ -427,7 +453,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
             optimizer.zero_grad()
             with autocast():
                 outputs = model(images)
-                loss = criterion(outputs, labels)
+                loss = 0.5 * bce_loss(outputs, labels) + 0.5 * dice_loss(outputs, labels)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -444,6 +470,8 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
         model.eval()
         val_loss = 0.0
         f1_scores = []
+        train_bce_total = 0.0
+        train_dice_total = 0.0
         with torch.no_grad():
             for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
                 images = images.to(device, non_blocking=True)
@@ -451,15 +479,20 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
 
                 with autocast():
                     outputs = model(images)
-                    loss = criterion(outputs, labels)
+                    bce = bce_loss(outputs, labels)
+                    dice = dice_loss(outputs, labels)
+                    loss = 0.5 * bce + 0.5 * dice
 
+                train_bce_total += bce.item() * images.size(0)
+                train_dice_total += dice.item() * images.size(0)
                 val_loss += loss.item() * images.size(0)
 
                 # Calcolo F1 per ciascuna immagine nel batch
                 for i in range(images.size(0)):
-                    thr = (outputs[i].max().item() - outputs[i].min().item())/2
+                    outputs[i] = torch.sigmoid(outputs[i])  # Applica sigmoid (da NON fare prima con BCEWithLogitsLoss !!!)
+                    thr = outputs[i].max().item() * binary_threshold
                     pred_kpts = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
-                    gt_kpts = extract_predicted_keypoints(labels[i].cpu(), threshold=0.01)
+                    gt_kpts = extract_predicted_keypoints(labels[i].cpu(), threshold=thr)
                     '''
                     if i == 0:
                         print(f'outputs[i].shape, outputs[i].max(), outputs[i].min(), outputs[i].mean() # DEBUG')
@@ -467,21 +500,24 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                         print(f'labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG')
                         print(labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG
                     '''
-                    f1 = compute_F1(pred_kpts, gt_kpts)
+                    p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[2, 4, 6])
                     f1_scores.append(f1)
 
                 del images, labels, outputs, loss
                 torch.cuda.empty_cache()
 
+        val_bce_avg = train_bce_total / len(val_loader.dataset)
+        val_dice_avg = train_dice_total / len(val_loader.dataset)
         f1_scores = np.array(f1_scores)
         val_loss /= len(val_loader.dataset)
         mean_f1 = np.mean(f1_scores, axis=0)
-        weighted_f1 = 0.5 * mean_f1[0] + 0.35 * mean_f1[1] + 0.15 * mean_f1[2]
-        
+        weighted_f1 = 0.2 * mean_f1[0] + 0.5 * mean_f1[1] + 0.3 * mean_f1[2]
+
         # --------- LOG ---------
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(f"Val BCE Loss: {val_bce_avg:.6f} | Val Dice Loss: {val_dice_avg:.6f}")
         print(f"F1 (thresholds = 2px): {mean_f1[0]:.4f} | F1 (thresholds = 4px): {mean_f1[1]:.4f} | F1 (thresholds = 6px): {mean_f1[2]:.4f}")
-        print(f"Weighted F1: 0.5 x {mean_f1[0]:.4f} + 0.35 x {mean_f1[1]:.4f} + 0.15 x {mean_f1[2]:.4f} = {weighted_f1:.4f}")
+        print(f"Weighted F1: 0.2 x {mean_f1[0]:.4f} + 0.5 x {mean_f1[1]:.4f} + 0.3 x {mean_f1[2]:.4f} = {weighted_f1:.4f}")
         print(f"[GPU] alloc: {torch.cuda.memory_allocated() / 1024**2:.1f} MB | max: {torch.cuda.max_memory_allocated() / 1024**2:.1f} MB")
 
         # --------- EARLY STOPPING & SAVE ---------
@@ -694,7 +730,7 @@ def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
     heatmap : torch.Tensor
         Heatmap predetta di forma (1, H, W) o (H, W).
     threshold : float
-        Valore di soglia per binarizzare la heatmap (default: 0.3).
+        Valore di soglia per binarizzare la heatmap (default: 0.97).
 
     Returns
     -------
@@ -710,7 +746,9 @@ def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
         heatmap = np.squeeze(heatmap)
     
     if threshold is None:
-        threshold = (heatmap.max()+heatmap.min())/2
+        threshold = heatmap.max()*0.97
+    else:
+        threshold *= heatmap.max()
         
     binary = (heatmap > threshold).astype(np.uint8)
     
@@ -732,7 +770,7 @@ def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
 
 
 
-def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, threshold=None):
+def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, threshold=None, npy=True, sigmoid=True):
     """
     Esegue inferenza su un'immagine e restituisce heatmap + keypoints predetti.
 
@@ -757,12 +795,16 @@ def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, 
         Coordinate dei keypoints in pixel.
     """
     # 1. Carica immagine grayscale e resize a 800x800
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise ValueError(f"Immagine non trovata: {img_path}")
-    img = cv2.resize(img, (800, 800))
-    img = img.astype('float32') / 255.0
-
+    if npy==False:
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError(f"Immagine non trovata: {img_path}")
+        img = cv2.resize(img, (800, 800))
+        img = img.astype('float32') / 255.0
+    else:
+        img = np.load(img_path)  # shape atteso (H, W)
+        img = img.astype(np.float32)  # assicurati che sia in float32
+    
     # 2. Convertila in tensore torch [1, 1, H, W]
     img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).to(device)
 
@@ -770,6 +812,7 @@ def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, 
     start_time = time.time()
     with torch.no_grad():
         output = model(img_tensor)  # output shape: [1, 1, 800, 800]
+        if sigmoid == True: output = torch.sigmoid(output)  # Applica sigmoid per ottenere valori tra 0 e 1
         inference_time = time.time() - start_time
     heatmap_pred = output.squeeze().cpu().numpy()  # shape: (800, 800)
 
@@ -788,7 +831,7 @@ def compute_pck_metrics(gt_points, pred_points, thresholds):
     Parametri:
     - gt_points (np.array di forma Nx2): Coordinate (x, y) dei keypoint ground truth.
     - pred_points (np.array di forma Mx2): Coordinate (x, y) dei keypoint predetti.
-    - thresholds (iterabile): Soglie di distanza in pixel per il calcolo del PCK.
+    - thresholds (iterabile o float/int): Soglie di distanza in pixel per il calcolo del PCK.
 
     Ritorna:
     - precisioni (list): Precisione per ciascuna soglia.
@@ -797,59 +840,103 @@ def compute_pck_metrics(gt_points, pred_points, thresholds):
     """
 
     if len(gt_points) == 0 or len(pred_points) == 0:
-        # Se non ci sono punti, ritorna tutti zeri
-        return [0.0] * len(thresholds), [0.0] * len(thresholds), [0.0] * len(thresholds)
+        return [0.0] * (len(thresholds) if isinstance(thresholds, (list, np.ndarray)) else 1), \
+               [0.0] * (len(thresholds) if isinstance(thresholds, (list, np.ndarray)) else 1), \
+               [0.0] * (len(thresholds) if isinstance(thresholds, (list, np.ndarray)) else 1)
 
-    precisions, recalls, f1_scores = [], [], []
+    if isinstance(thresholds, (list, np.ndarray)):
+        precisions, recalls, f1_scores = [], [], []
 
-    for t in thresholds:
-        # N.B. Un set è un insieme di elementi unici (ad es. se ha un 3 e gli aggiungo un altro 3, non lo aggiunge)
-        matched_gt = set()     # Indici GT già assegnati
-        matched_pred = set()   # Indici predetti già assegnati
-        tp = 0                 # True positives
+        for t in thresholds:
+            matched_gt = set()
+            matched_pred = set()
+            tp = 0
+
+            for i, pred in enumerate(pred_points):
+                pred = np.array(pred)
+                for j, gt in enumerate(gt_points):
+                    if j in matched_gt:
+                        continue
+                    gt = np.array(gt)
+                    distance = np.linalg.norm(pred - gt)
+                    if distance < t:
+                        matched_gt.add(j)
+                        matched_pred.add(i)
+                        tp += 1
+                        break
+
+            fp = len(pred_points) - tp
+            fn = len(gt_points) - tp
+
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+            precisions.append(p)
+            recalls.append(r)
+            f1_scores.append(f1)
+
+        return precisions, recalls, f1_scores
+
+    elif isinstance(thresholds, (int, float)):
+        matched_gt = set()
+        matched_pred = set()
+        tp = 0
 
         for i, pred in enumerate(pred_points):
+            pred = np.array(pred)
             for j, gt in enumerate(gt_points):
                 if j in matched_gt:
-                    continue  # Questo GT è già stato assegnato
-
+                    continue
+                gt = np.array(gt)
                 distance = np.linalg.norm(pred - gt)
-                if distance < t:
+                if distance < thresholds:
                     matched_gt.add(j)
                     matched_pred.add(i)
                     tp += 1
-                    break  # Un pred può essere associato a un solo GT
+                    break
 
-        fp = len(pred_points) - tp  # Predetti non corretti
-        fn = len(gt_points) - tp    # GT non trovati
+        fp = len(pred_points) - tp
+        fn = len(gt_points) - tp
 
         p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
-        precisions.append(p)
-        recalls.append(r)
-        f1_scores.append(f1)
-        
-        '''
-        print(f'Threshold: {t}px')
-        print(f'Predetti: {len(pred_points)}')
-        print(f'GT: {len(gt_points)}')
-        print(f'TP: {tp}')
-        print(f'FP: {fp}')
-        print(f'FN: {fn}')
-        print('')
-        '''
-        
-    return precisions, recalls, f1_scores
+        return [p], [r], [f1]  # restituisci comunque liste per compatibilità
 
 
 
-def compute_F1(gt_points, pred_points, thresholds=[2,4,6]):
-    gt_points = np.array(gt_points)
-    pred_points = np.array(pred_points)
-    f1_scores = compute_pck_metrics(gt_points, pred_points, thresholds=thresholds)[2]
-    return f1_scores
+
+
+def img_kp_pred_and_gr(keypoints_pred, keypoints_gt, img_path):
+    
+    # Carica immagine da file .npy (grayscale)
+    img = np.load(img_path)
+    img = img.astype(np.float32)
+    
+    # Normalizza se necessario
+    if img.max() <= 1.0:
+        img = (img * 255).astype(np.uint8)
+
+    # Converti in immagine colore per disegno
+    img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    # Disegna ground truth in BLU
+    for (x, y) in keypoints_gt:
+        cv2.circle(img_color, (int(x), int(y)), 2, (255, 0, 0), -1)  # GT: BLU
+
+    # Disegna predetti in VERDE
+    for (x, y) in keypoints_pred:
+        cv2.circle(img_color, (int(x), int(y)), 1, (0, 255, 0), -1)  # Pred: VERDE
+
+    # Mostra immagine
+    plt.figure(figsize=(8, 8))
+    plt.imshow(cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+    plt.title("Predetti (verde) vs Ground Truth (blu)")
+    plt.show()
+    
 
 
 
@@ -860,35 +947,35 @@ def inference_dataset(
     device='cuda',
     pixel_thresholds=[2, 4, 6],
     attention_model=True,
-    threshold_binary=None,
+    threshold=0.97,
     show_mask=False
 ):
     """
-    Calcola le metriche PCK (precision, recall, F1) su un dataset.
+    Calcola le metriche PCK (precision, recall, F1) su un dataset di immagini + CSV GT.
 
     Parametri
     ----------
     datapath : str
         Cartella principale che contiene 'images/train' e 'centers/train'.
     model_path : str
-        Percorso al modello U-Net salvato (.pt o .pth).
+        Percorso al file .pt/.pth del modello U-Net salvato.
     output_path : str
-        Cartella dove salvare le immagini annotate e le metriche.
+        Cartella dove salvare risultati (immagini annotate, heatmap, metriche).
     device : str
         'cuda' o 'cpu'.
     pixel_thresholds : list of int
-        Soglie di distanza in pixel (PCK).
+        Soglie PCK (in pixel).
     attention_model : bool
-        Se True, usa UNetWithAttention.
-    threshold : float
-        Soglia per binarizzazione heatmap.
+        Se True, usa UNetWithAttention, altrimenti usa UNet base.
+    threshold : float | None
+        Soglia di binarizzazione per la heatmap (es. 0.3 = 30% max).
     show_mask : bool
-        Se True, mostra le maschere binarie.
+        Se True, mostra le maschere binarie a video.
 
-    Ritorna
+    Returns
     -------
     dict
-        Chiavi: 'precision', 'recall', 'f1', ciascuna è una lista per soglia.
+        Contiene 'precision', 'recall', 'f1', 'stdmean_f1', 'inference_time' come liste o float.
     """
 
     os.makedirs(output_path, exist_ok=True)
@@ -897,88 +984,81 @@ def inference_dataset(
     os.makedirs(output_keypoints_dir, exist_ok=True)
     os.makedirs(output_heatmaps_dir, exist_ok=True)
 
-    # 1. Setup modello
     model_cls = UNetWithAttention if attention_model else UNet
     model = model_cls(in_channels=1, out_channels=1).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    # 2. Percorsi immagini e CSV
     img_dir = os.path.join(datapath, 'images', 'train')
     csv_dir = os.path.join(datapath, 'centers', 'train')
 
     image_paths = sorted([
-        os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.endswith('.png')
+        os.path.join(img_dir, f) for f in os.listdir(img_dir)
+        if f.endswith('.png') or f.endswith('.npy')
     ])
 
     all_precisions = np.zeros(len(pixel_thresholds))
     all_recalls = np.zeros(len(pixel_thresholds))
     all_f1s = np.zeros(len(pixel_thresholds))
+    all_f1_list = []  
+    inference_time_total = 0.0
     count = 0
 
-    inference_time_total = 0.0
     for img_path in image_paths:
         base_name = os.path.splitext(os.path.basename(img_path))[0]
         csv_path = os.path.join(csv_dir, base_name + '_centers.csv')
-
         if not os.path.exists(csv_path):
             continue
 
         gt_points = load_keypoints_from_csv(csv_path)
         heatmap, pred_points, inference_time = infer_keypoints_from_image(
-            img_path, model, device=device, threshold=threshold_binary, show_mask=show_mask
+            img_path, model, device=device, threshold=threshold, show_mask=show_mask
         )
-        
         inference_time_total += inference_time
-
         precisions, recalls, f1s = compute_pck_metrics(
             np.array(gt_points), np.array(pred_points), pixel_thresholds
         )
-
         all_precisions += np.array(precisions)
         all_recalls += np.array(recalls)
         all_f1s += np.array(f1s)
+        all_f1_list.append(f1s) 
         count += 1
 
-        # Carica immagine colore per annotazione
-        img_color = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if img_path.endswith('.npy'):
+            img = np.load(img_path).astype(np.float32)
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img_color = cv2.imread(img_path, cv2.IMREAD_COLOR)
 
-        # Disegna ground truth in BLU
         for (x, y) in gt_points:
-            cv2.circle(img_color, (int(x), int(y)), 2, (255, 0, 0), -1)  # BGR
-
-        # Disegna predetti in VERDE
+            cv2.circle(img_color, (int(x), int(y)), 2, (255, 0, 0), -1)
         for (x, y) in pred_points:
             cv2.circle(img_color, (int(x), int(y)), 1, (0, 255, 0), -1)
 
-        # Aggiungi scritta con metriche (solo media per immagine)
-        precision_1 = precisions[1]
-        recall_1 = recalls[1]
-        f1_1 = f1s[1]
-
-        text = f"P: {precision_1:.2f}  R: {recall_1:.2f}  F1: {f1_1:.2f} | thr={pixel_thresholds[1]}px"
+        text = f"P: {precisions[1]:.2f}  R: {recalls[1]:.2f}  F1: {f1s[1]:.2f} | thr={pixel_thresholds[1]}px"
         cv2.putText(img_color, text, (10, 20),
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                     fontScale=0.4,
-                    color=(255, 255, 255),  # bianco
+                    color=(255, 255, 255),
                     thickness=1,
                     lineType=cv2.LINE_AA)
 
-        # Salva immagine annotata
-        save_keypoint_path = os.path.join(output_keypoints_dir, base_name + '_pred.png')
-        cv2.imwrite(save_keypoint_path, img_color)
-        
-        # Salva heatmap (normalizzata a 0-255)
-        heatmap_img = (np.clip(heatmap, 0, 1) * 255).astype(np.uint8)
-        heatmap_path = os.path.join(output_heatmaps_dir, base_name + '_heatmap.png')
-        cv2.imwrite(heatmap_path, heatmap_img)
+        cv2.imwrite(os.path.join(output_keypoints_dir, base_name + '_pred.png'), img_color)
+        heatmap_norm = (np.clip(heatmap, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(output_heatmaps_dir, base_name + '_heatmap.png'), heatmap_norm)
 
     if count == 0:
-        raise ValueError("Nessuna immagine con CSV corrispondente trovata.")
+        raise ValueError("Nessuna immagine valida trovata (nessun CSV corrispondente).")
+
+    all_f1_array = np.array(all_f1_list)  # shape: (N immagini, len(pixel_thresholds))
+    stdmean_f1 = (np.std(all_f1_array, axis=0) / np.sqrt(count)).tolist()
 
     return {
         'precision': (all_precisions / count).tolist(),
         'recall': (all_recalls / count).tolist(),
         'f1': (all_f1s / count).tolist(),
+        'stdmean_f1': stdmean_f1,
         'inference_time': inference_time_total / count
     }

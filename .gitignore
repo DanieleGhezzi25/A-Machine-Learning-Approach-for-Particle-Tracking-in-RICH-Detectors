@@ -12,5 +12,8 @@
 KeyPoint_Detection/YOLO_dataset/
 UNet/UNet_dataset/
 UNet/Models/Model_20000_5000_160_180/output_inference
+UNet/Models/Model_92000_8000_160_180/output_inference
+UNet/Models/Model_92000_8000_160_180/output_inference100
+UNet/Models/Model_22500_2500_160_180_npy/output_inference
 
 **/*.pth
