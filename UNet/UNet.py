@@ -431,9 +431,20 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     # Imposta il dispositivo (GPU o CPU)
     model = model.to(device)
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([275], device=device)) 
-    dice_loss = DiceLoss()
+    # dice_loss = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
+    
+    weight_center=10  # quanto pesare il centro
+    center_size=400     # lato del quadrato centrale in pixel
+    
+    # Crea la mappa di pesi una volta sola
+    H, W = 800, 800
+    weight_map = torch.ones((1, H, W), dtype=torch.float32)
+    start = (H - center_size) // 2
+    end = start + center_size
+    weight_map[:, start:end, start:end] = weight_center
+    weight_map = weight_map.to(device)
 
     best_val_loss = float('inf')
     best_val_loss_1 = float('inf')
@@ -453,7 +464,8 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
             optimizer.zero_grad()
             with autocast():
                 outputs = model(images)
-                loss = 0.5 * bce_loss(outputs, labels) + 0.5 * dice_loss(outputs, labels)
+                loss = bce_loss(outputs, labels)
+                loss = (loss * weight_map).mean()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -471,7 +483,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
         val_loss = 0.0
         f1_scores = []
         train_bce_total = 0.0
-        train_dice_total = 0.0
+        # train_dice_total = 0.0
         with torch.no_grad():
             for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
                 images = images.to(device, non_blocking=True)
@@ -479,20 +491,24 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
 
                 with autocast():
                     outputs = model(images)
-                    bce = bce_loss(outputs, labels)
-                    dice = dice_loss(outputs, labels)
-                    loss = 0.5 * bce + 0.5 * dice
-
-                train_bce_total += bce.item() * images.size(0)
-                train_dice_total += dice.item() * images.size(0)
+                    loss = bce_loss(outputs, labels)
+                    # dice = dice_loss(outputs, labels)
+                    loss = (loss * weight_map).mean()
+                    
+                train_bce_total += loss.item() * images.size(0)
+                # train_dice_total += dice.item() * images.size(0)
                 val_loss += loss.item() * images.size(0)
 
                 # Calcolo F1 per ciascuna immagine nel batch
                 for i in range(images.size(0)):
                     outputs[i] = torch.sigmoid(outputs[i])  # Applica sigmoid (da NON fare prima con BCEWithLogitsLoss !!!)
                     thr = outputs[i].max().item() * binary_threshold
-                    pred_kpts = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
-                    gt_kpts = extract_predicted_keypoints(labels[i].cpu(), threshold=thr)
+                    pred_kpts_with_cov = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
+                    gt_kpts_with_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=0.5)
+
+                    # estrai solo le coordinate, senza covarianza
+                    pred_kpts = [kp for kp, cov in pred_kpts_with_cov]
+                    gt_kpts = [kp for kp, cov in gt_kpts_with_cov]
                     '''
                     if i == 0:
                         print(f'outputs[i].shape, outputs[i].max(), outputs[i].min(), outputs[i].mean() # DEBUG')
@@ -507,7 +523,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                 torch.cuda.empty_cache()
 
         val_bce_avg = train_bce_total / len(val_loader.dataset)
-        val_dice_avg = train_dice_total / len(val_loader.dataset)
+        # val_dice_avg = train_dice_total / len(val_loader.dataset)
         f1_scores = np.array(f1_scores)
         val_loss /= len(val_loader.dataset)
         mean_f1 = np.mean(f1_scores, axis=0)
@@ -515,7 +531,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
 
         # --------- LOG ---------
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-        print(f"Val BCE Loss: {val_bce_avg:.6f} | Val Dice Loss: {val_dice_avg:.6f}")
+        print(f"Val BCE Loss: {val_bce_avg:.6f}")
         print(f"F1 (thresholds = 2px): {mean_f1[0]:.4f} | F1 (thresholds = 4px): {mean_f1[1]:.4f} | F1 (thresholds = 6px): {mean_f1[2]:.4f}")
         print(f"Weighted F1: 0.2 x {mean_f1[0]:.4f} + 0.5 x {mean_f1[1]:.4f} + 0.3 x {mean_f1[2]:.4f} = {weighted_f1:.4f}")
         print(f"[GPU] alloc: {torch.cuda.memory_allocated() / 1024**2:.1f} MB | max: {torch.cuda.max_memory_allocated() / 1024**2:.1f} MB")
@@ -763,7 +779,19 @@ def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
     keypoints = []
     for i in range(1, num_labels):
         cx, cy = centroids[i]
-        keypoints.append([int(round(cx)), int(round(cy))])
+        keypoint_coords = ([int(round(cx)), int(round(cy))])
+
+        mask = (labels == i)
+        ys, xs = np.where(mask)
+
+        if len(xs) < 2:
+            # Covarianza mal definita con meno di 2 punti
+            continue
+
+        coords = np.stack([xs, ys], axis=1)  # forma (N, 2)
+        cov = np.cov(coords, rowvar=False)   # forma (2, 2)
+
+        keypoints.append((keypoint_coords, cov))
 
     return keypoints
 
@@ -1011,9 +1039,10 @@ def inference_dataset(
             continue
 
         gt_points = load_keypoints_from_csv(csv_path)
-        heatmap, pred_points, inference_time = infer_keypoints_from_image(
+        heatmap, pred_points_and_cov, inference_time = infer_keypoints_from_image(
             img_path, model, device=device, threshold=threshold, show_mask=show_mask
         )
+        pred_points = [kp[0] for kp in pred_points_and_cov]
         inference_time_total += inference_time
         precisions, recalls, f1s = compute_pck_metrics(
             np.array(gt_points), np.array(pred_points), pixel_thresholds
@@ -1062,3 +1091,397 @@ def inference_dataset(
         'stdmean_f1': stdmean_f1,
         'inference_time': inference_time_total / count
     }
+    
+    
+    
+    
+    
+# ---------------------------------------------------------------------------------------- #
+
+
+'''
+    Modulo con UNet aventi Hard Attention.
+'''
+
+
+
+class PatchDataset(Dataset):
+    def __init__(self, image_dir, label_dir, transform=None):
+        self.image_files = sorted(os.listdir(image_dir))
+        self.label_files = sorted(os.listdir(label_dir))
+        self.image_dir = image_dir
+        self.label_dir = label_dir
+        self.transform = transform
+
+        assert len(self.image_files) == len(self.label_files), "Numero diverso di immagini e label!"
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        image = np.load(os.path.join(self.image_dir, self.image_files[idx]))  # (800,800)
+        label = np.load(os.path.join(self.label_dir, self.label_files[idx]))  # (800,800)
+
+        h, w = image.shape
+        assert h == 800 and w == 800, "Le immagini devono essere 800x800"
+
+        center_x = w // 2
+        center_y = h // 2
+        half = 208 // 2
+
+        # Patch centrale in alto (center_x, center_y - offset)
+        patch_top = image[center_y - 208: center_y, center_x - half: center_x + half]
+        patch_bot = image[center_y: center_y + 208, center_x - half: center_x + half]
+        label_top = label[center_y - 208: center_y, center_x - half: center_x + half]
+        label_bot = label[center_y: center_y + 208, center_x - half: center_x + half]
+
+        # Cornice = immagine completa con centro (due patch) azzerato
+        patch_frame = image.copy()
+        label_frame = label.copy()
+        patch_frame[center_y - 208: center_y + 208, center_x - half: center_x + half] = 0
+        label_frame[center_y - 208: center_y + 208, center_x - half: center_x + half] = 0
+
+        # Trasformazioni
+        to_tensor = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0)
+        patch_top = to_tensor(patch_top)
+        patch_bot = to_tensor(patch_bot)
+        patch_frame = to_tensor(patch_frame)
+        label_top = to_tensor(label_top)
+        label_bot = to_tensor(label_bot)
+        label_frame = to_tensor(label_frame)
+
+        return {
+                "image_patch_top": patch_top,
+                "image_patch_bot": patch_bot,
+                "image_patch_frame": patch_frame,
+                "label_patch_top": label_top,
+                "label_patch_bot": label_bot,
+                "label_patch_frame": label_frame,
+            }
+
+
+
+
+
+
+def get_dataloaders_patch(data_dir, batch_size=8, transform=None):
+    train_dataset = PatchDataset(
+        image_dir=os.path.join(data_dir, 'images', 'train'),
+        label_dir=os.path.join(data_dir, 'labels', 'train'),
+        transform=transform
+    )
+
+    val_dataset = PatchDataset(
+        image_dir=os.path.join(data_dir, 'images', 'val'),
+        label_dir=os.path.join(data_dir, 'labels', 'val'),
+        transform=transform
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
+
+    return train_loader, val_loader
+
+
+
+
+
+def train_unet_with_patches(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5, binary_threshold=0.97):
+    
+    model = model.to(device)
+
+    # Pos weight diversi per patch
+    pos_weights = {
+        'top': torch.tensor([100.0], device=device),
+        'bot': torch.tensor([100.0], device=device),
+        'frame': torch.tensor([300.0], device=device)
+    }
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = GradScaler()
+    dice_loss = DiceLoss()
+
+    best_val_loss = float('inf')
+    best_f1 = 0.0
+    patience_counter = 0
+
+    patch_names = ['top', 'bot', 'frame']
+    patch_weights = {'top': 1.0, 'bot': 1.0, 'frame': 0.5}
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
+            loss_total = 0.0
+
+            for patch in patch_names:
+                images = batch[f"image_patch_{patch}"].to(device)
+                labels = batch[f"label_patch_{patch}"].to(device)
+
+                optimizer.zero_grad()
+                with autocast():
+                    outputs = model(images)
+                    bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch])
+                    loss = 0.5 * bce_loss(outputs, labels) + 0.5 * dice_loss(outputs, labels)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                loss_total += patch_weights[patch] * loss.item() * images.size(0)
+
+            train_loss += loss_total
+            torch.cuda.empty_cache()
+
+        train_loss /= len(train_loader.dataset)
+
+        # VALIDATION
+        model.eval()
+        val_loss = 0.0
+        f1_scores = []
+
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                for patch in patch_names:
+                    images = batch[f"image_patch_{patch}"].to(device)
+                    labels = batch[f"label_patch_{patch}"].to(device)
+
+                    with autocast():
+                        outputs = model(images)
+                        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch])
+                        loss = 0.5 * bce_loss(outputs, labels) + 0.5 * dice_loss(outputs, labels)
+
+                    val_loss += patch_weights[patch] * loss.item() * images.size(0)
+
+                    for i in range(images.size(0)):
+                        out = torch.sigmoid(outputs[i])
+                        thr = out.max().item() * binary_threshold
+                        pred_kpts = extract_predicted_keypoints(out.cpu(), threshold=thr)
+                        gt_kpts = extract_predicted_keypoints(labels[i].cpu(), threshold=thr)
+                        p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[2, 4, 6])
+                        f1_scores.append(f1)
+
+                torch.cuda.empty_cache()
+
+        val_loss /= len(val_loader.dataset)
+        f1_scores = np.array(f1_scores)
+        mean_f1 = np.mean(f1_scores, axis=0)
+        weighted_f1 = 0.2 * mean_f1[0] + 0.5 * mean_f1[1] + 0.3 * mean_f1[2]
+
+        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(f"F1 @2px: {mean_f1[0]:.4f} | F1 @4px: {mean_f1[1]:.4f} | F1 @6px: {mean_f1[2]:.4f} | Weighted F1: {weighted_f1:.4f}")
+
+        if val_loss <= best_val_loss and weighted_f1 >= best_f1:
+            best_val_loss = val_loss
+            best_f1 = weighted_f1
+            torch.save(model.state_dict(), "best_unet_patch.pth")
+            print(" ==> Nuovo modello salvato (val loss e F1 migliorati)")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f" ==> Nessun miglioramento. patience: {patience_counter}/{patience}")
+            if patience_counter >= patience:
+                print("Early stopping attivato.")
+                break
+
+        print("")
+
+
+
+
+
+# ---------------------------------------------------------------------------------------- #
+
+'''
+    Modulo con UNet con Double Encoder (UNetDoubleEncoder).
+'''
+
+
+class UnetDoubleEncoder(nn.Module):
+    def __init__(self, in_channels1=1, in_channels2=1, base_channels=64, out_channels=1):
+        super().__init__()
+        
+        # --- Encoder 1 ---
+        self.enc1_1 = nn.Sequential(
+            nn.Conv2d(in_channels1, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1_1 = nn.MaxPool2d(2)
+        
+        self.enc1_2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels*2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*2, base_channels*2, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1_2 = nn.MaxPool2d(2)
+        
+        self.enc1_3 = nn.Sequential(
+            nn.Conv2d(base_channels*2, base_channels*4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*4, base_channels*4, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1_3 = nn.MaxPool2d(2)
+        
+        # --- Encoder 2 ---
+        self.enc2_1 = nn.Sequential(
+            nn.Conv2d(in_channels2, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2_1 = nn.MaxPool2d(2)
+        
+        self.enc2_2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels*2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*2, base_channels*2, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2_2 = nn.MaxPool2d(2)
+        
+        self.enc2_3 = nn.Sequential(
+            nn.Conv2d(base_channels*2, base_channels*4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*4, base_channels*4, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2_3 = nn.MaxPool2d(2)
+        
+        # --- Bottleneck ---
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels*8, base_channels*8, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*8, base_channels*8, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # --- Decoder ---
+        self.up3 = nn.ConvTranspose2d(base_channels*8, base_channels*4, kernel_size=2, stride=2)
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(base_channels*12, base_channels*4, 3, padding=1),  # concatenated skip connections *2 + upsampled
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*4, base_channels*4, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.up2 = nn.ConvTranspose2d(base_channels*4, base_channels*2, kernel_size=2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_channels*6, base_channels*2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*2, base_channels*2, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.up1 = nn.ConvTranspose2d(base_channels*2, base_channels, kernel_size=2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels*3, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Output layer
+        self.out_conv = nn.Conv2d(base_channels, out_channels, 1)
+    
+    def forward(self, x1, x2):
+        # Encoder 1
+        e1_1 = self.enc1_1(x1)
+        p1_1 = self.pool1_1(e1_1)
+        e1_2 = self.enc1_2(p1_1)
+        p1_2 = self.pool1_2(e1_2)
+        e1_3 = self.enc1_3(p1_2)
+        p1_3 = self.pool1_3(e1_3)
+        
+        # Encoder 2
+        e2_1 = self.enc2_1(x2)
+        p2_1 = self.pool2_1(e2_1)
+        e2_2 = self.enc2_2(p2_1)
+        p2_2 = self.pool2_2(e2_2)
+        e2_3 = self.enc2_3(p2_2)
+        p2_3 = self.pool2_3(e2_3)
+        
+        # Bottleneck: concat due encoder outputs
+        bottleneck_in = torch.cat([p1_3, p2_3], dim=1)  # concat canali
+        b = self.bottleneck(bottleneck_in)
+        
+        # Decoder step 3
+        up3 = self.up3(b)
+        # concat skip connection dai 2 encoder
+        skip3 = torch.cat([e1_3, e2_3], dim=1)
+        dec3_in = torch.cat([up3, skip3], dim=1)
+        d3 = self.dec3(dec3_in)
+        
+        # Decoder step 2
+        up2 = self.up2(d3)
+        skip2 = torch.cat([e1_2, e2_2], dim=1)
+        dec2_in = torch.cat([up2, skip2], dim=1)
+        d2 = self.dec2(dec2_in)
+        
+        # Decoder step 1
+        up1 = self.up1(d2)
+        skip1 = torch.cat([e1_1, e2_1], dim=1)
+        dec1_in = torch.cat([up1, skip1], dim=1)
+        d1 = self.dec1(dec1_in)
+        
+        out = self.out_conv(d1)
+        return out
+
+
+
+
+class DoubleInputHeatmapDataset(Dataset):
+    def __init__(self, image_dir1, image_dir2, label_dir, image_size=(800, 800)):
+        self.image_dir1 = image_dir1
+        self.image_dir2 = image_dir2
+        self.label_dir = label_dir
+        self.image_size = image_size
+
+        self.image_filenames = sorted([f for f in os.listdir(image_dir1) if f.lower().endswith('.npy')])
+        # Assumo che i file siano gli stessi in tutte le cartelle e allineati per nome.
+
+    def __len__(self):
+        return len(self.image_filenames)
+
+    def __getitem__(self, idx):
+        fname = self.image_filenames[idx]
+
+        img1 = np.load(os.path.join(self.image_dir1, fname))
+        img2 = np.load(os.path.join(self.image_dir2, fname))
+        label = np.load(os.path.join(self.label_dir, fname))
+
+        # Espandi canale (1 x H x W)
+        img1 = np.expand_dims(img1, axis=0)
+        img2 = np.expand_dims(img2, axis=0)
+        label = np.expand_dims(label, axis=0)
+
+        img1 = torch.from_numpy(img1).float()
+        img2 = torch.from_numpy(img2).float()
+        label = torch.from_numpy(label).float()
+
+        return img1, img2, label
+
+
+
+def get_double_input_dataloaders(data_dir, batch_size=8, image_size=(800, 800)):
+    train_dataset = DoubleInputHeatmapDataset(
+        image_dir1=os.path.join(data_dir, 'images1', 'train'),
+        image_dir2=os.path.join(data_dir, 'images2', 'train'),
+        label_dir=os.path.join(data_dir, 'labels', 'train'),
+        image_size=image_size
+    )
+    val_dataset = DoubleInputHeatmapDataset(
+        image_dir1=os.path.join(data_dir, 'images1', 'val'),
+        image_dir2=os.path.join(data_dir, 'images2', 'val'),
+        label_dir=os.path.join(data_dir, 'labels', 'val'),
+        image_size=image_size
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader
