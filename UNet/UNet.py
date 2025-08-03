@@ -435,7 +435,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
     
-    weight_center=10  # quanto pesare il centro
+    weight_center=8.5  # quanto pesare il centro
     center_size=400     # lato del quadrato centrale in pixel
     
     # Crea la mappa di pesi una volta sola
@@ -504,7 +504,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                     outputs[i] = torch.sigmoid(outputs[i])  # Applica sigmoid (da NON fare prima con BCEWithLogitsLoss !!!)
                     thr = outputs[i].max().item() * binary_threshold
                     pred_kpts_with_cov = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
-                    gt_kpts_with_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=0.5)
+                    gt_kpts_with_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=0.4)
 
                     # estrai solo le coordinate, senza covarianza
                     pred_kpts = [kp for kp, cov in pred_kpts_with_cov]
@@ -1363,7 +1363,7 @@ class UnetDoubleEncoder(nn.Module):
         # --- Decoder ---
         self.up3 = nn.ConvTranspose2d(base_channels*8, base_channels*4, kernel_size=2, stride=2)
         self.dec3 = nn.Sequential(
-            nn.Conv2d(base_channels*12, base_channels*4, 3, padding=1),  # concatenated skip connections *2 + upsampled
+            nn.Conv2d(base_channels*12, base_channels*4, 3, padding=1),  # concat skip connection *2 + upsampled
             nn.ReLU(inplace=True),
             nn.Conv2d(base_channels*4, base_channels*4, 3, padding=1),
             nn.ReLU(inplace=True)
@@ -1385,7 +1385,6 @@ class UnetDoubleEncoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Output layer
         self.out_conv = nn.Conv2d(base_channels, out_channels, 1)
     
     def forward(self, x1, x2):
@@ -1404,26 +1403,34 @@ class UnetDoubleEncoder(nn.Module):
         p2_2 = self.pool2_2(e2_2)
         e2_3 = self.enc2_3(p2_2)
         p2_3 = self.pool2_3(e2_3)
-        
-        # Bottleneck: concat due encoder outputs
-        bottleneck_in = torch.cat([p1_3, p2_3], dim=1)  # concat canali
+
+        # Upsample features from encoder 2 if needed (bottleneck)
+        if p1_3.shape[2:] != p2_3.shape[2:]:
+            p2_3 = F.interpolate(p2_3, size=p1_3.shape[2:], mode='bilinear', align_corners=False)
+        bottleneck_in = torch.cat([p1_3, p2_3], dim=1)
         b = self.bottleneck(bottleneck_in)
         
         # Decoder step 3
         up3 = self.up3(b)
-        # concat skip connection dai 2 encoder
+        # Upsample skip connection features if needed
+        if e1_3.shape[2:] != e2_3.shape[2:]:
+            e2_3 = F.interpolate(e2_3, size=e1_3.shape[2:], mode='bilinear', align_corners=False)
         skip3 = torch.cat([e1_3, e2_3], dim=1)
         dec3_in = torch.cat([up3, skip3], dim=1)
         d3 = self.dec3(dec3_in)
         
         # Decoder step 2
         up2 = self.up2(d3)
+        if e1_2.shape[2:] != e2_2.shape[2:]:
+            e2_2 = F.interpolate(e2_2, size=e1_2.shape[2:], mode='bilinear', align_corners=False)
         skip2 = torch.cat([e1_2, e2_2], dim=1)
         dec2_in = torch.cat([up2, skip2], dim=1)
         d2 = self.dec2(dec2_in)
         
         # Decoder step 1
         up1 = self.up1(d2)
+        if e1_1.shape[2:] != e2_1.shape[2:]:
+            e2_1 = F.interpolate(e2_1, size=e1_1.shape[2:], mode='bilinear', align_corners=False)
         skip1 = torch.cat([e1_1, e2_1], dim=1)
         dec1_in = torch.cat([up1, skip1], dim=1)
         d1 = self.dec1(dec1_in)
@@ -1485,3 +1492,140 @@ def get_double_input_dataloaders(data_dir, batch_size=8, image_size=(800, 800)):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader
+
+
+
+
+
+def train_double_encoder_unet(model, train_loader, val_loader, 
+                             num_epochs=50, lr=1e-3, device='cuda', 
+                             patience=5, binary_threshold=0.97):
+    '''
+    Funzione per addestrare il modello UNet con doppio encoder e doppio input.
+    Struttura e parametri simili a train_unet.
+    '''
+
+    model = model.to(device)
+    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([275], device=device))
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = GradScaler()
+
+    weight_center = 10
+    center_size = 400
+    H, W = 800, 800
+    weight_map = torch.ones((1, H, W), dtype=torch.float32)
+    start = (H - center_size) // 2
+    end = start + center_size
+    weight_map[:, start:end, start:end] = weight_center
+    weight_map = weight_map.to(device)
+
+    best_val_loss = float('inf')
+    best_val_loss_1 = float('inf')
+    best_f1 = 0.0
+    best_f1_1 = 0.0
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        # --------- TRAIN ---------
+        model.train()
+        train_loss = 0.0
+
+        for img1, img2, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
+            img1 = img1.to(device, non_blocking=True)
+            img2 = img2.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(img1, img2)
+                loss = bce_loss(outputs, labels)
+                loss = (loss * weight_map).mean()
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item() * img1.size(0)
+
+            del img1, img2, labels, outputs, loss
+            torch.cuda.empty_cache()
+
+        train_loss /= len(train_loader.dataset)
+
+        # --------- VALIDATION ---------
+        model.eval()
+        val_loss = 0.0
+        f1_scores = []
+        val_bce_total = 0.0
+
+        with torch.no_grad():
+            for img1, img2, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                img1 = img1.to(device, non_blocking=True)
+                img2 = img2.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+
+                with autocast():
+                    outputs = model(img1, img2)
+                    loss = bce_loss(outputs, labels)
+                    loss = (loss * weight_map).mean()
+
+                val_bce_total += loss.item() * img1.size(0)
+                val_loss += loss.item() * img1.size(0)
+
+                # Calcolo F1 per ogni immagine nel batch
+                for i in range(img1.size(0)):
+                    outputs[i] = torch.sigmoid(outputs[i])
+                    thr = outputs[i].max().item() * binary_threshold
+
+                    pred_kpts_with_cov = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
+                    gt_kpts_with_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=0.5)
+
+                    pred_kpts = [kp for kp, cov in pred_kpts_with_cov]
+                    gt_kpts = [kp for kp, cov in gt_kpts_with_cov]
+
+                    p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[2, 4, 6])
+                    f1_scores.append(f1)
+
+                del img1, img2, labels, outputs, loss
+                torch.cuda.empty_cache()
+
+        val_bce_avg = val_bce_total / len(val_loader.dataset)
+        val_loss /= len(val_loader.dataset)
+        mean_f1 = np.mean(f1_scores, axis=0)
+        weighted_f1 = 0.2 * mean_f1[0] + 0.5 * mean_f1[1] + 0.3 * mean_f1[2]
+
+        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(f"Val BCE Loss: {val_bce_avg:.6f}")
+        print(f"F1 (2px): {mean_f1[0]:.4f} | F1 (4px): {mean_f1[1]:.4f} | F1 (6px): {mean_f1[2]:.4f}")
+        print(f"Weighted F1: {weighted_f1:.4f}")
+        print(f"[GPU] alloc: {torch.cuda.memory_allocated() / 1024**2:.1f} MB | max: {torch.cuda.max_memory_allocated() / 1024**2:.1f} MB")
+
+        # --------- EARLY STOPPING & SAVE ---------
+        if val_loss <= best_val_loss and weighted_f1 >= best_f1:
+            best_val_loss = val_loss
+            best_f1 = weighted_f1
+            best_val_loss_1 = val_loss
+            best_f1_1 = weighted_f1
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_double_encoder_unet.pth")
+            print(" ==> Nuovo modello salvato (val loss e F1 migliorati)")
+        elif val_loss <= best_val_loss_1:
+            best_val_loss_1 = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_double_encoder_unet_for_val_loss.pth")
+            print(" ==> Nuovo modello salvato (val loss migliorata)")
+        elif weighted_f1 >= best_f1_1:
+            best_f1_1 = weighted_f1
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_double_encoder_unet_for_f1.pth")
+            print(" ==> Nuovo modello salvato (F1 migliorata)")
+        else:
+            patience_counter += 1
+            print(f" ==> Nessun miglioramento. patience: {patience_counter}/{patience}")
+            if patience_counter >= patience:
+                print("Early stopping attivato.")
+                break
+
+        print('')
+
+
