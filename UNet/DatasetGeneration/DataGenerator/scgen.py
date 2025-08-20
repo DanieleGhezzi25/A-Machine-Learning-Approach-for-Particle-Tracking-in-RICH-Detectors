@@ -171,41 +171,43 @@ class SCGen:
             - 'particle_types': The types of the particles.
             - 'rings': The generated Cherenkov rings. If a particle has no hits, its ring will be an empty array.
             - 'tracked_rings': mapping of (center, momentum, particle_type) to the corresponding ring index in the rings array.
+            - 'radii': The Cherenkov radii for each particle.
         """
         # 1. Sample generation parameters
         ptypes = np.random.choice(self.particle_types, size=num_particles)
-        centers = self.centers_distribution.resample(num_particles)
-        centers = centers.T # Transpose to get (num_particles, 2) shape
-        momenta = np.array([self.momenta_log_distributions[pt].resample(1)[0] for pt in ptypes])
-        momenta = np.exp(momenta)  # Transform back to linear scale
-        momenta = momenta.flatten()  # Flatten to 1D array
+        centers = self.centers_distribution.resample(num_particles).T
+        momenta = np.zeros(num_particles)
+
+        # 1b. Sample valid momenta (beta above Cherenkov threshold)
+        for i, pt in enumerate(ptypes):
+            valid = False
+            while not valid:
+                p = np.exp(self.momenta_log_distributions[pt].resample(1)[0])
+                m = self.masses[pt]
+                beta = p / np.sqrt(p**2 + m**2)
+                arccos_arg = 1 / (self.refractive_index * beta)
+                if arccos_arg <= 1:  # particle above threshold
+                    valid = True
+                    momenta[i] = p
 
         # 2. Compute Cherenkov angles and radii
         masses = np.array([self.masses[pt] for pt in ptypes])
         beta = momenta / np.sqrt(np.square(momenta) + np.square(masses))
-        arccos_arg = 1 / (self.refractive_index * beta) # Calculate the argument for arccos
-        # Set Cherenkov angle to 0 where argument > 1 (below threshold)
-        cherenkov_angles = np.where(arccos_arg <= 1, np.arccos(arccos_arg), 0)
+        arccos_arg = 1 / (self.refractive_index * beta)
+        cherenkov_angles = np.arccos(arccos_arg)  # all valid now
         radii = np.tan(cherenkov_angles) * self.max_cherenkov_radius / np.tan(self.max_cherenkov_angle)
 
         # 3. Compute the number of photon hits for each particle
-        N_mean = np.where(
-            radii > 0, 
-            np.round(
-                self.N_init * np.square(np.sin(cherenkov_angles)) / np.square(np.sin(self.max_cherenkov_angle))
-            ), 
-            0
+        N_mean = np.round(
+            self.N_init * np.square(np.sin(cherenkov_angles)) / np.square(np.sin(self.max_cherenkov_angle))
         ).astype(int)
-        # Sample the number of hits from a Poisson distribution
         N_hits = np.random.poisson(N_mean)
 
         # 4. Generate the Cherenkov rings
         rings = self._create_rings(centers, radii, N_hits)
 
-        # Create mapping of (center, momentum, particle_type) to the corresponding ring index
-        # At first, when generating the event, every ring has a corresponding track.
-        # but later, tracks can be pruned, so we need to keep track of the original indices.
-        tracked_rings = np.arange(num_particles) # Each index corresponds to a ring in the rings array
+        # 5. Track mapping
+        tracked_rings = np.arange(num_particles)  # each particle corresponds to a ring
 
         return {
             'centers': centers,
@@ -213,8 +215,9 @@ class SCGen:
             'particle_types': ptypes,
             'rings': rings,
             'tracked_rings': tracked_rings,
-            'radii': radii 
+            'radii': radii
         }
+
 
     def generate_dataset(self, num_events: int, num_particles_per_event, parallel = False, batch_size: int = 64, progress_bar: bool = True) -> list[dict[str, Any]]:
         """

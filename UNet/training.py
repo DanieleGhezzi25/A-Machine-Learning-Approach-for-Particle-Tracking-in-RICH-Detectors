@@ -23,7 +23,7 @@ print(f"Training su dispositivo: {device}")
 model = UNetWithAttention(in_channels=1, out_channels=1)  # o 3 se RGB
 
 # Carica i dataloader (adatta il path)
-datapath = '/user/gr1/delphi/dghezzi/UNet/UNet_dataset/92000_8000_160_180_npy'
+datapath = '/user/gr1/delphi/dghezzi/UNet/UNet_dataset/22500_2500_160_180_npy'
 train_loader, val_loader = get_dataloaders(data_dir=datapath, batch_size=8, image_size=(800,800))
 
 # Avvia il training

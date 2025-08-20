@@ -431,11 +431,12 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     # Imposta il dispositivo (GPU o CPU)
     model = model.to(device)
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([275], device=device)) 
+    l1_loss = nn.L1Loss()
     # dice_loss = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
     
-    weight_center=8.5  # quanto pesare il centro
+    weight_center=20  # quanto pesare il centro
     center_size=400     # lato del quadrato centrale in pixel
     
     # Crea la mappa di pesi una volta sola
@@ -464,8 +465,14 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
             optimizer.zero_grad()
             with autocast():
                 outputs = model(images)
-                loss = bce_loss(outputs, labels)
-                loss = (loss * weight_map).mean()
+                bce = bce_loss(outputs, labels)
+                bce = (bce * weight_map).mean()
+
+                probs = torch.sigmoid(outputs)
+                l1 = l1_loss(probs, labels)
+                l1 = (l1 * weight_map).mean()
+
+                loss = bce + 0.3*l1
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -491,10 +498,15 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
 
                 with autocast():
                     outputs = model(images)
-                    loss = bce_loss(outputs, labels)
-                    # dice = dice_loss(outputs, labels)
-                    loss = (loss * weight_map).mean()
-                    
+                    bce = bce_loss(outputs, labels)
+                    bce = (bce * weight_map).mean()
+
+                    probs = torch.sigmoid(outputs)
+                    l1 = l1_loss(probs, labels)
+                    l1 = (l1 * weight_map).mean()
+
+                    loss = bce + 0.3 * l1
+
                 train_bce_total += loss.item() * images.size(0)
                 # train_dice_total += dice.item() * images.size(0)
                 val_loss += loss.item() * images.size(0)
@@ -516,7 +528,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                         print(f'labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG')
                         print(labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG
                     '''
-                    p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[2, 4, 6])
+                    p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[4])
                     f1_scores.append(f1)
 
                 del images, labels, outputs, loss
@@ -526,22 +538,19 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
         # val_dice_avg = train_dice_total / len(val_loader.dataset)
         f1_scores = np.array(f1_scores)
         val_loss /= len(val_loader.dataset)
-        mean_f1 = np.mean(f1_scores, axis=0)
-        weighted_f1 = 0.2 * mean_f1[0] + 0.5 * mean_f1[1] + 0.3 * mean_f1[2]
+        f1_scores = f1_scores.mean(axis=0)
 
         # --------- LOG ---------
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-        print(f"Val BCE Loss: {val_bce_avg:.6f}")
-        print(f"F1 (thresholds = 2px): {mean_f1[0]:.4f} | F1 (thresholds = 4px): {mean_f1[1]:.4f} | F1 (thresholds = 6px): {mean_f1[2]:.4f}")
-        print(f"Weighted F1: 0.2 x {mean_f1[0]:.4f} + 0.5 x {mean_f1[1]:.4f} + 0.3 x {mean_f1[2]:.4f} = {weighted_f1:.4f}")
+        print(f"F1 (thresholds = 4px): {f1_scores[0]:.4f}")
         print(f"[GPU] alloc: {torch.cuda.memory_allocated() / 1024**2:.1f} MB | max: {torch.cuda.max_memory_allocated() / 1024**2:.1f} MB")
 
         # --------- EARLY STOPPING & SAVE ---------
-        if val_loss <= best_val_loss and weighted_f1 >= best_f1:
+        if val_loss <= best_val_loss and f1_scores[0] >= best_f1:
             best_val_loss = val_loss
-            best_f1 = weighted_f1
+            best_f1 = f1_scores[0]
             best_val_loss_1 = val_loss
-            best_f1_1 = weighted_f1
+            best_f1_1 = f1_scores[0]
             patience_counter = 0
             torch.save(model.state_dict(), "best_unet.pth")
             print(" ==> Nuovo modello salvato (val loss e F1 migliorati)")
@@ -550,8 +559,8 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
             patience_counter = 0
             torch.save(model.state_dict(), "best_unet_for_val_loss.pth")
             print(" ==> Nuovo modello salvato (val loss migliorata)")
-        elif weighted_f1 >= best_f1_1:
-            best_f1_1 = weighted_f1
+        elif f1_scores[0] >= best_f1_1:
+            best_f1_1 = f1_scores[0]
             patience_counter = 0
             torch.save(model.state_dict(), "best_unet_for_f1.pth")
             print(" ==> Nuovo modello salvato (F1 migliorata)")
@@ -567,153 +576,6 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
 
 
 # ---------------------------------------------------------------------------------------- #
-
-
-
-
-'''
-    Funzioni per estrarre coordinate discrete di keypoints da una heatmap.
-    Utile per calcolare metriche come precision, recall, F1 a partire da PCK (Percentage of Correct Keypoints).    
-'''
-
-
-'''
-def extract_keypoints_from_heatmap(heatmap, threshold=0.5):
-    """
-    Estrae le coordinate dei keypoints da una heatmap.
-    
-    Parameters
-    ----------
-    heatmap : torch.Tensor
-        Heatmap con valori tra 0 e 1.
-    threshold : float
-        Soglia per considerare un pixel come keypoint (default: 0.5).
-    
-    Returns
-    -------
-    list
-        Lista con le coordinate dei keypoints e le loro covarianze.
-    """
-    # Converte la heatmap da tensore PyTorch a numpy array 2D rimuovendo dimensioni inutili
-    # Conversione sicura: torch tensor → numpy, altrimenti lascia com'è
-    if hasattr(heatmap, 'cpu'):
-        heatmap = heatmap.squeeze().cpu().numpy()
-    else:
-        heatmap = np.squeeze(heatmap)    
-    
-    # Binarizza la heatmap con la soglia, pixel > threshold diventano 1, altrimenti 0
-    binary = (heatmap > threshold).astype(np.uint8)
-    
-    # Etichetta i gruppi connessi (componenti connesse) nella matrice binaria
-    labeled, num_features = scipy.ndimage.label(binary)
-
-    keypoints = []
-    # Ciclo su ciascun gruppo connesso trovato (ogni potenziale keypoint)
-    for i in range(1, num_features + 1):
-        # Crea una maschera booleana per selezionare il gruppo i-esimo
-        mask = labeled == i
-        
-        # Pesa la heatmap originale con la maschera per considerare solo quel gruppo
-        weights = heatmap * mask
-        
-        # Somma totale dei pesi all'interno del gruppo
-        total_weight = np.sum(weights)
-        if total_weight == 0:
-            # Se il peso totale è zero (gruppo nullo) passa al successivo
-            continue
-
-        # Costruisce coordinate x,y per ogni pixel della heatmap
-        x_coords, y_coords = np.meshgrid(np.arange(heatmap.shape[1]), np.arange(heatmap.shape[0]))
-        
-        # Moltiplica le coordinate x e y per i pesi e appiattisce l'array
-        x = (x_coords * weights).ravel() # .ravel = appiattisce l'array 2D in 1D
-        y = (y_coords * weights).ravel()
-        
-        # Unisce i vettori x,y e normalizza per la somma dei pesi per ottenere la media ponderata
-        points = np.vstack((x, y)) / total_weight
-
-        # Calcola la media (coordinate centrali) del keypoint: mu_x e mu_y
-        mu = np.sum(points, axis=1)
-
-        # Calcola la differenza delle coordinate dai valori medi
-        diffs = np.vstack((x_coords.ravel() - mu[0], y_coords.ravel() - mu[1]))
-        
-        # Calcola la matrice di covarianza pesata, che indica la "forma" e distribuzione spaziale del keypoint
-        cov = np.cov(diffs, aweights=weights.ravel())
-
-        # Aggiunge alla lista il keypoint con coordinate medie e covarianza
-        keypoints.append((mu[0], mu[1], cov))  # x, y, matrice di covarianza
-
-    return keypoints
-
-
-
-
-def plot_keypoints_with_covariances(keypoints):
-    """
-    Plotta i keypoints su due grafici affiancati:
-    - A sinistra solo i punti (x, y)
-    - A destra i punti con le ellissi di covarianza
-
-    Parameters
-    ----------
-    keypoints : list of tuples
-        Lista di tuple (x, y, cov) dove cov è la matrice di covarianza 2x2
-    """
-
-    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-
-    # Primo grafico: punti semplici
-    axs[0].set_title("Keypoints (punti)")
-    axs[0].set_aspect('equal')
-    axs[0].grid(True)
-    axs[0].set_xlabel('x')
-    axs[0].set_ylabel('y')
-
-    # Secondo grafico: punti + ellissi covarianza
-    axs[1].set_title("Keypoints con ellissi di covarianza")
-    axs[1].set_aspect('equal')
-    axs[1].grid(True)
-    axs[1].set_xlabel('x')
-    axs[1].set_ylabel('y')
-
-    for (x, y, cov) in keypoints:
-        # Primo plot: solo il punto
-        axs[0].plot(x, y, 'ro')
-
-        # Secondo plot: punto
-        axs[1].plot(x, y, 'ro')
-
-        # Calcolo degli autovalori e autovettori della covarianza
-        vals, vecs = np.linalg.eigh(cov)
-
-        # Ordinamento degli autovalori dal più grande al più piccolo
-        order = vals.argsort()[::-1]
-        vals = vals[order]
-        vecs = vecs[:, order]
-
-        # Angolo di rotazione dell'ellisse (in gradi)
-        angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
-
-        # Ampiezza degli assi dell'ellisse = 2 * sqrt(autovalori)
-        width, height = 2 * np.sqrt(vals)
-
-        # Crea l'ellisse e la aggiunge al grafico
-        ell = Ellipse(xy=(x, y), width=width, height=height, angle=angle,
-                      edgecolor='blue', fc='none', lw=2, alpha=0.6)
-        axs[1].add_patch(ell)
-
-    # Limiti automatici con padding
-    for ax in axs:
-        all_x = [kp[0] for kp in keypoints]
-        all_y = [kp[1] for kp in keypoints]
-        ax.set_xlim(min(all_x) - 5, max(all_x) + 5)
-        ax.set_ylim(min(all_y) - 5, max(all_y) + 5)
-
-    plt.tight_layout()
-    plt.show()
-'''
-
 
 
 
@@ -841,11 +703,11 @@ def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, 
     with torch.no_grad():
         output = model(img_tensor)  # output shape: [1, 1, 800, 800]
         if sigmoid == True: output = torch.sigmoid(output)  # Applica sigmoid per ottenere valori tra 0 e 1
-        inference_time = time.time() - start_time
     heatmap_pred = output.squeeze().cpu().numpy()  # shape: (800, 800)
 
     # 4. Estrai keypoints
     keypoints = extract_predicted_keypoints(heatmap_pred, threshold=threshold, show_mask=show_mask)
+    inference_time = time.time() - start_time
 
     return heatmap_pred, keypoints, inference_time
 
@@ -868,61 +730,35 @@ def compute_pck_metrics(gt_points, pred_points, thresholds):
     """
 
     if len(gt_points) == 0 or len(pred_points) == 0:
-        return [0.0] * (len(thresholds) if isinstance(thresholds, (list, np.ndarray)) else 1), \
-               [0.0] * (len(thresholds) if isinstance(thresholds, (list, np.ndarray)) else 1), \
-               [0.0] * (len(thresholds) if isinstance(thresholds, (list, np.ndarray)) else 1)
+        n = len(thresholds) if hasattr(thresholds, "__iter__") else 1
+        return [0.0] * n, [0.0] * n, [0.0] * n
 
-    if isinstance(thresholds, (list, np.ndarray)):
-        precisions, recalls, f1_scores = [], [], []
+    if not hasattr(thresholds, "__iter__"):
+        thresholds = [thresholds]
 
-        for t in thresholds:
-            matched_gt = set()
-            matched_pred = set()
-            tp = 0
+    precisions, recalls, f1_scores = [], [], []
 
-            for i, pred in enumerate(pred_points):
-                pred = np.array(pred)
-                for j, gt in enumerate(gt_points):
-                    if j in matched_gt:
-                        continue
-                    gt = np.array(gt)
-                    distance = np.linalg.norm(pred - gt)
-                    if distance < t:
-                        matched_gt.add(j)
-                        matched_pred.add(i)
-                        tp += 1
-                        break
+    for t in thresholds:
+        # Calcola tutte le distanze pred-gt
+        dists = []
+        for i, pred in enumerate(pred_points):
+            for j, gt in enumerate(gt_points):
+                dist = np.linalg.norm(np.array(pred) - np.array(gt))
+                if dist < t:
+                    dists.append((dist, i, j))
 
-            fp = len(pred_points) - tp
-            fn = len(gt_points) - tp
+        # Ordina per distanza crescente
+        dists.sort(key=lambda x: x[0])
 
-            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-
-            precisions.append(p)
-            recalls.append(r)
-            f1_scores.append(f1)
-
-        return precisions, recalls, f1_scores
-
-    elif isinstance(thresholds, (int, float)):
         matched_gt = set()
         matched_pred = set()
         tp = 0
 
-        for i, pred in enumerate(pred_points):
-            pred = np.array(pred)
-            for j, gt in enumerate(gt_points):
-                if j in matched_gt:
-                    continue
-                gt = np.array(gt)
-                distance = np.linalg.norm(pred - gt)
-                if distance < thresholds:
-                    matched_gt.add(j)
-                    matched_pred.add(i)
-                    tp += 1
-                    break
+        for dist, i, j in dists:
+            if i not in matched_pred and j not in matched_gt:
+                matched_pred.add(i)
+                matched_gt.add(j)
+                tp += 1
 
         fp = len(pred_points) - tp
         fn = len(gt_points) - tp
@@ -931,7 +767,11 @@ def compute_pck_metrics(gt_points, pred_points, thresholds):
         r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
-        return [p], [r], [f1]  # restituisci comunque liste per compatibilità
+        precisions.append(p)
+        recalls.append(r)
+        f1_scores.append(f1)
+
+    return precisions, recalls, f1_scores
 
 
 
@@ -1105,7 +945,7 @@ def inference_dataset(
 
 
 
-class PatchDataset(Dataset):
+class TwoPatchDataset(Dataset):
     def __init__(self, image_dir, label_dir, transform=None):
         self.image_files = sorted(os.listdir(image_dir))
         self.label_files = sorted(os.listdir(label_dir))
@@ -1119,68 +959,55 @@ class PatchDataset(Dataset):
         return len(self.image_files)
 
     def __getitem__(self, idx):
-        image = np.load(os.path.join(self.image_dir, self.image_files[idx]))  # (800,800)
-        label = np.load(os.path.join(self.label_dir, self.label_files[idx]))  # (800,800)
+        image = np.load(os.path.join(self.image_dir, self.image_files[idx]))  # (800, 800)
+        label = np.load(os.path.join(self.label_dir, self.label_files[idx]))  # (800, 800)
 
         h, w = image.shape
         assert h == 800 and w == 800, "Le immagini devono essere 800x800"
 
-        center_x = w // 2
-        center_y = h // 2
-        half = 208 // 2
+        # Coord. del quadrato centrale 416x416
+        size = 416
+        start_x = (w - size) // 2
+        start_y = (h - size) // 2
+        end_x = start_x + size
+        end_y = start_y + size
 
-        # Patch centrale in alto (center_x, center_y - offset)
-        patch_top = image[center_y - 208: center_y, center_x - half: center_x + half]
-        patch_bot = image[center_y: center_y + 208, center_x - half: center_x + half]
-        label_top = label[center_y - 208: center_y, center_x - half: center_x + half]
-        label_bot = label[center_y: center_y + 208, center_x - half: center_x + half]
+        # Estrai patch centrale
+        patch_center = image[start_y:end_y, start_x:end_x]
+        label_center = label[start_y:end_y, start_x:end_x]
 
-        # Cornice = immagine completa con centro (due patch) azzerato
+        # Crea patch cornice
         patch_frame = image.copy()
         label_frame = label.copy()
-        patch_frame[center_y - 208: center_y + 208, center_x - half: center_x + half] = 0
-        label_frame[center_y - 208: center_y + 208, center_x - half: center_x + half] = 0
+        patch_frame[start_y:end_y, start_x:end_x] = 0
+        label_frame[start_y:end_y, start_x:end_x] = 0
 
-        # Trasformazioni
         to_tensor = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0)
-        patch_top = to_tensor(patch_top)
-        patch_bot = to_tensor(patch_bot)
-        patch_frame = to_tensor(patch_frame)
-        label_top = to_tensor(label_top)
-        label_bot = to_tensor(label_bot)
-        label_frame = to_tensor(label_frame)
-
         return {
-                "image_patch_top": patch_top,
-                "image_patch_bot": patch_bot,
-                "image_patch_frame": patch_frame,
-                "label_patch_top": label_top,
-                "label_patch_bot": label_bot,
-                "label_patch_frame": label_frame,
-            }
-
-
+            "image_patch_center": to_tensor(patch_center),
+            "image_patch_frame": to_tensor(patch_frame),
+            "label_patch_center": to_tensor(label_center),
+            "label_patch_frame": to_tensor(label_frame),
+        }
 
 
 
 
 def get_dataloaders_patch(data_dir, batch_size=8, transform=None):
-    train_dataset = PatchDataset(
+    train_dataset = TwoPatchDataset(
         image_dir=os.path.join(data_dir, 'images', 'train'),
         label_dir=os.path.join(data_dir, 'labels', 'train'),
         transform=transform
     )
-
-    val_dataset = PatchDataset(
+    val_dataset = TwoPatchDataset(
         image_dir=os.path.join(data_dir, 'images', 'val'),
         label_dir=os.path.join(data_dir, 'labels', 'val'),
         transform=transform
     )
-
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
-
     return train_loader, val_loader
+
 
 
 
@@ -1192,9 +1019,8 @@ def train_unet_with_patches(model, train_loader, val_loader, num_epochs=50, lr=1
 
     # Pos weight diversi per patch
     pos_weights = {
-        'top': torch.tensor([100.0], device=device),
-        'bot': torch.tensor([100.0], device=device),
-        'frame': torch.tensor([300.0], device=device)
+        'center': torch.tensor([92.0], device=device),
+        'frame': torch.tensor([1035.0], device=device)
     }
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -1205,8 +1031,8 @@ def train_unet_with_patches(model, train_loader, val_loader, num_epochs=50, lr=1
     best_f1 = 0.0
     patience_counter = 0
 
-    patch_names = ['top', 'bot', 'frame']
-    patch_weights = {'top': 1.0, 'bot': 1.0, 'frame': 0.5}
+    patch_names = ['center', 'frame']
+    patch_weights = {'center': 1.0, 'frame': 0.8}
 
     for epoch in range(num_epochs):
         model.train()
@@ -1222,8 +1048,13 @@ def train_unet_with_patches(model, train_loader, val_loader, num_epochs=50, lr=1
                 optimizer.zero_grad()
                 with autocast():
                     outputs = model(images)
-                    bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch])
-                    loss = 0.5 * bce_loss(outputs, labels) + 0.5 * dice_loss(outputs, labels)
+                    if patch == 'center':
+                        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch].clone().detach().to(device))
+                        loss = bce_loss(outputs, labels) # + 0.3 * dice_loss(outputs, labels)
+                    elif patch == 'frame':
+                        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch].clone().detach().to(device))
+                        loss = bce_loss(outputs, labels)
+
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -1249,16 +1080,24 @@ def train_unet_with_patches(model, train_loader, val_loader, num_epochs=50, lr=1
 
                     with autocast():
                         outputs = model(images)
-                        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch])
-                        loss = 0.5 * bce_loss(outputs, labels) + 0.5 * dice_loss(outputs, labels)
+                        
+                        if patch == 'center':
+                            bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch].clone().detach().to(device))
+                            loss = 0.7 * bce_loss(outputs, labels) + 0.3 * dice_loss(outputs, labels)
+                        elif patch == 'frame':
+                            bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch].clone().detach().to(device))
+                            loss = bce_loss(outputs, labels)
+
 
                     val_loss += patch_weights[patch] * loss.item() * images.size(0)
 
                     for i in range(images.size(0)):
                         out = torch.sigmoid(outputs[i])
                         thr = out.max().item() * binary_threshold
-                        pred_kpts = extract_predicted_keypoints(out.cpu(), threshold=thr)
-                        gt_kpts = extract_predicted_keypoints(labels[i].cpu(), threshold=thr)
+                        pred_kpts_and_cov = extract_predicted_keypoints(out.cpu(), threshold=thr)
+                        gt_kpts_and_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=thr)
+                        pred_kpts = [kp for kp, cov in pred_kpts_and_cov]
+                        gt_kpts = [kp for kp, cov in gt_kpts_and_cov]
                         p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[2, 4, 6])
                         f1_scores.append(f1)
 
@@ -1509,16 +1348,7 @@ def train_double_encoder_unet(model, train_loader, val_loader,
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([275], device=device))
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
-
-    weight_center = 10
-    center_size = 400
-    H, W = 800, 800
-    weight_map = torch.ones((1, H, W), dtype=torch.float32)
-    start = (H - center_size) // 2
-    end = start + center_size
-    weight_map[:, start:end, start:end] = weight_center
-    weight_map = weight_map.to(device)
-
+    
     best_val_loss = float('inf')
     best_val_loss_1 = float('inf')
     best_f1 = 0.0
@@ -1539,7 +1369,6 @@ def train_double_encoder_unet(model, train_loader, val_loader,
             with autocast():
                 outputs = model(img1, img2)
                 loss = bce_loss(outputs, labels)
-                loss = (loss * weight_map).mean()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -1567,7 +1396,6 @@ def train_double_encoder_unet(model, train_loader, val_loader,
                 with autocast():
                     outputs = model(img1, img2)
                     loss = bce_loss(outputs, labels)
-                    loss = (loss * weight_map).mean()
 
                 val_bce_total += loss.item() * img1.size(0)
                 val_loss += loss.item() * img1.size(0)
