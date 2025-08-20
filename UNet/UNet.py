@@ -390,7 +390,7 @@ class DiceLoss(nn.Module):
 
 
 
-def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5, binary_threshold=0.97):
+def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5, pos_weight=275, binary_threshold=0.97, f1_earlystopping=True):
     '''
     Funzione per addestrare il modello U-Net.
     Parameters
@@ -430,7 +430,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     
     # Imposta il dispositivo (GPU o CPU)
     model = model.to(device)
-    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([275], device=device)) 
+    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device)) 
     l1_loss = nn.L1Loss()
     # dice_loss = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -511,66 +511,79 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                 # train_dice_total += dice.item() * images.size(0)
                 val_loss += loss.item() * images.size(0)
 
-                # Calcolo F1 per ciascuna immagine nel batch
-                for i in range(images.size(0)):
-                    outputs[i] = torch.sigmoid(outputs[i])  # Applica sigmoid (da NON fare prima con BCEWithLogitsLoss !!!)
-                    thr = outputs[i].max().item() * binary_threshold
-                    pred_kpts_with_cov = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
-                    gt_kpts_with_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=0.4)
+                if f1_earlystopping is True:
+                    # Calcolo F1 per ciascuna immagine nel batch
+                    for i in range(images.size(0)):
+                        outputs[i] = torch.sigmoid(outputs[i])  # Applica sigmoid (da NON fare prima con BCEWithLogitsLoss !!!)
+                        thr = outputs[i].max().item() * binary_threshold
+                        pred_kpts_with_cov = extract_predicted_keypoints(outputs[i].cpu(), threshold=thr)
+                        gt_kpts_with_cov = extract_predicted_keypoints(labels[i].cpu(), threshold=0.4)
 
-                    # estrai solo le coordinate, senza covarianza
-                    pred_kpts = [kp for kp, cov in pred_kpts_with_cov]
-                    gt_kpts = [kp for kp, cov in gt_kpts_with_cov]
-                    '''
-                    if i == 0:
-                        print(f'outputs[i].shape, outputs[i].max(), outputs[i].min(), outputs[i].mean() # DEBUG')
-                        print(outputs[i].shape, outputs[i].max(), outputs[i].min(), outputs[i].mean()) # DEBUG
-                        print(f'labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG')
-                        print(labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG
-                    '''
-                    p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[4])
-                    f1_scores.append(f1)
+                        # estrai solo le coordinate, senza covarianza
+                        pred_kpts = [kp for kp, cov in pred_kpts_with_cov]
+                        gt_kpts = [kp for kp, cov in gt_kpts_with_cov]
+                        '''
+                        if i == 0:
+                            print(f'outputs[i].shape, outputs[i].max(), outputs[i].min(), outputs[i].mean() # DEBUG')
+                            print(outputs[i].shape, outputs[i].max(), outputs[i].min(), outputs[i].mean()) # DEBUG
+                            print(f'labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG')
+                            print(labels[i].shape, labels[i].max(), labels[i].min(), labels[i].mean()) # DEBUG
+                        '''
+                        p, r, f1 = compute_pck_metrics(gt_kpts, pred_kpts, thresholds=[4])
+                        f1_scores.append(f1)
 
                 del images, labels, outputs, loss
                 torch.cuda.empty_cache()
 
-        val_bce_avg = train_bce_total / len(val_loader.dataset)
-        # val_dice_avg = train_dice_total / len(val_loader.dataset)
-        f1_scores = np.array(f1_scores)
+        if f1_earlystopping is True:
+            f1_scores = np.array(f1_scores)
+            f1_scores = f1_scores.mean(axis=0)
         val_loss /= len(val_loader.dataset)
-        f1_scores = f1_scores.mean(axis=0)
 
         # --------- LOG ---------
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-        print(f"F1 (thresholds = 4px): {f1_scores[0]:.4f}")
+        if f1_earlystopping is True: print(f"F1 (thresholds = 4px): {f1_scores:.4f}")
         print(f"[GPU] alloc: {torch.cuda.memory_allocated() / 1024**2:.1f} MB | max: {torch.cuda.max_memory_allocated() / 1024**2:.1f} MB")
 
         # --------- EARLY STOPPING & SAVE ---------
-        if val_loss <= best_val_loss and f1_scores[0] >= best_f1:
-            best_val_loss = val_loss
-            best_f1 = f1_scores[0]
-            best_val_loss_1 = val_loss
-            best_f1_1 = f1_scores[0]
-            patience_counter = 0
-            torch.save(model.state_dict(), "best_unet.pth")
-            print(" ==> Nuovo modello salvato (val loss e F1 migliorati)")
-        elif val_loss <= best_val_loss_1:
-            best_val_loss_1 = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "best_unet_for_val_loss.pth")
-            print(" ==> Nuovo modello salvato (val loss migliorata)")
-        elif f1_scores[0] >= best_f1_1:
-            best_f1_1 = f1_scores[0]
-            patience_counter = 0
-            torch.save(model.state_dict(), "best_unet_for_f1.pth")
-            print(" ==> Nuovo modello salvato (F1 migliorata)")
-        else:
-            patience_counter += 1
-            print(f" ==> Nessun miglioramento. patience: {patience_counter}/{patience}")
-            if patience_counter >= patience:
-                print("Early stopping attivato.")
-                break
-        
+        if f1_earlystopping is True:
+            if val_loss <= best_val_loss and f1_scores[0] >= best_f1:
+                best_val_loss = val_loss
+                best_f1 = f1_scores[0]
+                best_val_loss_1 = val_loss
+                best_f1_1 = f1_scores[0]
+                patience_counter = 0
+                torch.save(model.state_dict(), "best_unet.pth")
+                print(" ==> Nuovo modello salvato (val loss e F1 migliorati)")
+            elif val_loss <= best_val_loss_1:
+                best_val_loss_1 = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), "best_unet_for_val_loss.pth")
+                print(" ==> Nuovo modello salvato (val loss migliorata)")
+            elif f1_scores[0] >= best_f1_1:
+                best_f1_1 = f1_scores[0]
+                patience_counter = 0
+                torch.save(model.state_dict(), "best_unet_for_f1.pth")
+                print(" ==> Nuovo modello salvato (F1 migliorata)")
+            else:
+                patience_counter += 1
+                print(f" ==> Nessun miglioramento. patience: {patience_counter}/{patience}")
+                if patience_counter >= patience:
+                    print("Early stopping attivato.")
+                    break
+        elif f1_earlystopping is False:
+            if val_loss <= best_val_loss_1:
+                best_val_loss_1 = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), f"best_unet{epoch+1}.pth")
+                print(" ==> Nuovo modello salvato (val loss migliorata)")
+            else:
+                patience_counter += 1
+                print(f" ==> Nessun miglioramento. patience: {patience_counter}/{patience}")
+                if patience_counter >= patience:
+                    print("Early stopping attivato.")
+                    break
+                
         print('')
 
 
@@ -1457,3 +1470,26 @@ def train_double_encoder_unet(model, train_loader, val_loader,
         print('')
 
 
+
+def pos_weight_calculator(datapath):
+
+    val_labels_dir = os.path.join(datapath, "labels", "val")
+    pos_weights = []
+
+    for label_file in os.listdir(val_labels_dir):
+        if label_file.endswith('.npy'):
+            heatmap = np.load(os.path.join(val_labels_dir, label_file))
+            
+            pos_mass = np.sum(heatmap)  # somma intensità positive (heatmap continua)
+            neg_mass = heatmap.size - pos_mass
+            
+            pos_weight_img = neg_mass / (pos_mass + 1e-6)
+            pos_weights.append(pos_weight_img)
+
+    pos_weights = np.array(pos_weights)
+    mean_pos_weight = np.mean(pos_weights)
+    std_pos_weight = np.std(pos_weights) / np.sqrt(len(pos_weights))
+
+    print(f"Pos weight medio (calcolato dal validation set): {mean_pos_weight:.4f} ± {std_pos_weight:.4f} (n={len(pos_weights)})")
+
+    return mean_pos_weight

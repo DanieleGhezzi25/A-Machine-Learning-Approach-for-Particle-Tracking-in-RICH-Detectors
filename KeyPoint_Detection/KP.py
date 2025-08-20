@@ -99,71 +99,95 @@ def show_with_MCpoints(results, image_path, txt_path, show_image=True, save_imag
 ##########################
 # FUNZIONE 3: UTILITY PER ESTRARRE KEYPOINT
 ##########################
-def keypoints_from_result(result):
-    if result.keypoints is None:
+def keypoints_from_result(results):
+    all_keypoints = []
+
+    for result in results:  # results è una lista
+        if result.keypoints is None:
+            continue
+        keypoints = result.keypoints.xy.cpu().numpy()  # shape: (num_preds, num_kp, 2)
+
+        # Siccome hai un solo keypoint per predizione, togli l'asse dei keypoints
+        keypoints = keypoints[:, 0, :]   # --> shape (num_preds, 2)
+
+        all_keypoints.append(keypoints)
+
+    if len(all_keypoints) == 0:
         return np.empty((0, 2))
-    # Sposta il tensore sulla CPU e converti in numpy
-    keypoints_cpu = result.keypoints.xy.cpu().numpy()
-    # Se proprio vuoi la lista con doppio ciclo:
-    return np.array([[x, y] for kp in keypoints_cpu for x, y in kp])
+
+    return np.concatenate(all_keypoints, axis=0)
+
+
 
 def keypoints_from_txt(txt_path, img_size=256):
-    data = np.loadtxt(txt_path, usecols=(-3, -2))
-    return data * img_size if len(data) > 0 else np.empty((0, 2))
+    if not os.path.exists(txt_path):
+        return np.empty((0, 2))
+    data = np.loadtxt(txt_path, usecols=(-3, -2), ndmin=2)  # forza sempre shape (N,2)
+    return data * img_size
+
 
 
 ##########################
 # FUNZIONE 4: METRICHE PRECISION, RECALL, F1, PCK PER SOGLIE MULTIPLE
 ##########################
-def compute_pck_metrics(gt_points, pred_points, thresholds):
+def compute_pck_metrics(pred_points, gt_points, thresholds):
     """
-    Calcola precision, recall e F1-score per varie soglie di distanza (PCK).
+    Calcola precision, recall e F1-score per varie soglie di distanza (PCK)
+    usando Hungarian matching ottimale.
 
     Parametri:
-    - gt_points (np.array di forma Nx2): Coordinate (x, y) dei keypoint ground truth.
-    - pred_points (np.array di forma Mx2): Coordinate (x, y) dei keypoint predetti.
-    - thresholds (iterabile o float/int): Soglie di distanza in pixel per il calcolo del PCK.
+    - pred_points (np.array Mx2): keypoint predetti (x, y)
+    - gt_points (np.array Nx2): keypoint ground truth (x, y)
+    - thresholds (iterabile o float/int): soglie di distanza in pixel
 
     Ritorna:
-    - precisioni (list): Precisione per ciascuna soglia.
-    - recall (list): Recall per ciascuna soglia.
-    - f1_scores (list): F1-score per ciascuna soglia.
+    - precisions (list): Precisione per ciascuna soglia
+    - recalls (list): Recall per ciascuna soglia
+    - f1_scores (list): F1-score per ciascuna soglia
     """
 
-    if len(gt_points) == 0 or len(pred_points) == 0:
-        n = len(thresholds) if hasattr(thresholds, "__iter__") else 1
-        return [0.0] * n, [0.0] * n, [0.0] * n
-
+    # Check input
+    assert pred_points.shape[1] == 2 and gt_points.shape[1] == 2, \
+        "Sia pred_points che gt_points devono avere forma (N, 2)"
+    
     if not hasattr(thresholds, "__iter__"):
         thresholds = [thresholds]
 
+    # Caso limite: nessun punto
+    if len(gt_points) == 0 and len(pred_points) == 0:
+        n = len(thresholds)
+        return [1.0]*n, [1.0]*n, [1.0]*n
+    elif len(gt_points) == 0 or len(pred_points) == 0:
+        n = len(thresholds)
+        return [0.0]*n, [0.0]*n, [0.0]*n
+
     precisions, recalls, f1_scores = [], [], []
 
+    # Matrice distanze pred x gt
+    dists = np.linalg.norm(pred_points[:, None, :] - gt_points[None, :, :], axis=2)
+
     for t in thresholds:
-        # Calcola tutte le distanze pred-gt
-        dists = []
-        for i, pred in enumerate(pred_points):
-            for j, gt in enumerate(gt_points):
-                dist = np.linalg.norm(np.array(pred) - np.array(gt))
-                if dist < t:
-                    dists.append((dist, i, j))
+        # Matrice costi: penalizza oltre soglia
+        cost = dists.copy()
+        cost[cost > t] = 1e6  # alto costo per match invalidi
 
-        # Ordina per distanza crescente
-        dists.sort(key=lambda x: x[0])
+        # Hungarian assignment
+        row_ind, col_ind = linear_sum_assignment(cost)
 
-        matched_gt = set()
-        matched_pred = set()
         tp = 0
+        matched_pred = set()
+        matched_gt = set()
 
-        for dist, i, j in dists:
-            if i not in matched_pred and j not in matched_gt:
-                matched_pred.add(i)
-                matched_gt.add(j)
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < 1e6:  # match valido
                 tp += 1
+                matched_pred.add(r)
+                matched_gt.add(c)
 
-        fp = len(pred_points) - tp
-        fn = len(gt_points) - tp
+        fp = len(pred_points) - len(matched_pred)
+        fn = len(gt_points) - len(matched_gt)
 
+        # Metriche
         p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
@@ -175,10 +199,11 @@ def compute_pck_metrics(gt_points, pred_points, thresholds):
     return precisions, recalls, f1_scores
 
 
+
 ##########################
 # FUNZIONE 5: INFERENZA SU INTERO DATASET + mAP
 ##########################
-def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5,
+def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_size=420,
                         thresholds=[2,4,6], show=False, save=False, output_dir="output"):
     """
     Esegue inferenza su tutte le immagini e calcola le metriche su threshold multiple.
@@ -200,8 +225,7 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5,
     model = YOLO(model_path)
 
     sum_prec, sum_rec, sum_f1 = [np.zeros(len(thresholds)) for _ in range(3)]
-    total_time = 0.0
-    total_images = 0
+    total_time, total_images = 0.0, 0
 
     image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png'))])
 
@@ -216,16 +240,17 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5,
         if not results:
             continue
 
-        pred = keypoints_from_result(results[0])
-        gt = keypoints_from_txt(label_path)
+        pred = keypoints_from_result(results[0])  # <-- tua funzione
+        gt = keypoints_from_txt(label_path, img_size=img_size)       # <-- tua funzione
+
         if len(gt) == 0 and len(pred) == 0:
             continue
 
-        prec, rec, f1 = compute_pck_metrics(gt, pred, thresholds)
+        prec, rec, f1 = map(np.array, compute_pck_metrics(pred, gt, thresholds))
 
         sum_prec += prec
-        sum_rec += rec
-        sum_f1 += f1
+        sum_rec  += rec
+        sum_f1   += f1
         total_images += 1
 
         if show or save:
@@ -235,7 +260,7 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5,
     mean_prec = sum_prec / total_images
     mean_rec = sum_rec / total_images
     mean_f1 = sum_f1 / total_images
-    avg_time = total_time / total_images if total_images > 0 else 0.0
+    avg_time = total_time / total_images
 
     print(f"\n== Risultati medi su {total_images} immagini ==")
     for i, t in enumerate(thresholds):
@@ -255,61 +280,92 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5,
 ##########################
 # FUNZIONE 6: INFERENZA SU INTERO DATASET + mAP + confidence
 ##########################
-def inference_3Dmap(images_dir, labels_dir, model_path,
-                    pck_thresholds=np.arange(3, 7, 1), 
-                    conf_thresholds=np.arange(0.20, 0.80, 0.20)):
-    
-    '''
-    Esegue inferenza su tutte le immagini e calcola F1 su soglie multiple di PCK e confidenza.
-    Costruisce una matrice mAP 3D con righe PCK e colonne Confidence, con valori di F1.
-    
+def inference_F1map(images_dir, labels_dir, model_path,
+                    img_size=420,
+                    thresholds=np.arange(3, 7, 1),
+                    conf_thresholds=np.arange(0.2, 0.8, 0.2),
+                    save_csv=True, save_img=True):
+    """
+    Esegue inferenza su tutte le immagini di una directory con un modello YOLO usando GPU, calcola
+    F1-score medio su soglie multiple di threshold PCK e confidenza, e costruisce una matrice F1 2D.
+    Restituisce anche il numero medio di punti predetti per ogni conf_threshold.
+
     Parameters:
-    - images_dir (str): Directory immagini.
-    - labels_dir (str): Directory ground truth.
-    - model_path (str): YOLO model.
-    - pck_thresholds (np.array): Soglie PCK in pixel.
-    - conf_thresholds (np.array): Soglie di confidenza per le predizioni
+    - images_dir (str): Path directory immagini.
+    - labels_dir (str): Path directory file ground truth.
+    - model_path (str): Percorso modello YOLO.
+    - thresholds (np.array): Soglie PCK in pixel.
+    - conf_thresholds (np.array): Soglie di confidenza YOLO.
+    - save_csv (bool): Se True salva F1_matrix in CSV.
+    - save_img (bool): Se True salva immagine 3D della superficie F1.
+    
     Returns:
-    - F1_matrix (np.array): Matrice 3D con F1 per ogni combinazione di PCK e confidenza    
-    '''
-    
-    
+    - F1_matrix (np.array): Matrice 2D F1 medio per ogni combinazione threshold/conf.
+    - num_pred_mean (np.array): Numero medio di keypoints predetti per ciascuna conf_threshold.
+    """
+
     model = YOLO(model_path)
-    F1_matrix = np.zeros((len(conf_thresholds), len(pck_thresholds)))
+    F1_matrix = np.zeros((len(conf_thresholds), len(thresholds)))
+    num_pred_sum = np.zeros(len(conf_thresholds))
+    num_images = 0
 
-    for i, conf in enumerate(conf_thresholds):
-        for j, pck_thr in enumerate(pck_thresholds):
-            sum_prec, sum_rec = 0.0, 0.0
-            total_images = 0
-            image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png'))])
+    image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg','.png'))])
 
-            for image_name in image_files:
-                image_path = os.path.join(images_dir, image_name)
-                label_path = os.path.join(labels_dir, os.path.splitext(image_name)[0] + ".txt")
-                results = model.predict(source=image_path, conf=conf, save=False)
-                if not results:
-                    continue
-                pred = keypoints_from_result(results[0])
-                gt = keypoints_from_txt(label_path)
-                if len(gt) == 0 or len(pred) == 0:
-                    continue
-                prec, rec = compute_pck_metrics(gt, pred, np.array([pck_thr]))
-                sum_prec += prec[0]
-                sum_rec += rec[0]
-                total_images += 1
+    total_start = time.time()
+    for image_name in image_files:
+        image_path = os.path.join(images_dir, image_name)
+        label_path = os.path.join(labels_dir, os.path.splitext(image_name)[0] + ".txt")
+        gt_points = keypoints_from_txt(label_path,img_size=img_size)
+        if len(gt_points) == 0:
+            continue
 
-            if total_images > 0:
-                precision = sum_prec / total_images
-                recall = sum_rec / total_images
-                F1_matrix[i, j] = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
+        results = model.predict(source=image_path, conf=0.0, save=False, verbose=False)
+        if not results:
+            continue
+        pred_points = keypoints_from_result(results[0])
+        if len(pred_points) == 0:
+            continue
 
-    plot_F1_surface(pck_thresholds, conf_thresholds, F1_matrix)
-    return F1_matrix
+        conf_values = results[0].keypoints.conf.cpu().numpy().flatten()
+
+        for i, conf_thr in enumerate(conf_thresholds):
+            # Filtra predizioni per conf_threshold
+            filtered_pred = np.array([kp for kp, conf in zip(pred_points, conf_values) if conf >= conf_thr])
+            num_pred_sum[i] += len(filtered_pred)
+
+            if len(filtered_pred) == 0:
+                continue
+
+            for j, pck_thr in enumerate(thresholds):
+                _, _, f1 = compute_pck_metrics(filtered_pred, gt_points, [pck_thr])
+                F1_matrix[i, j] += f1[0]
+
+        num_images += 1
+
+    # Medie
+    if num_images > 0:
+        F1_matrix /= num_images
+        num_pred_mean = num_pred_sum / num_images
+    else:
+        num_pred_mean = np.zeros(len(conf_thresholds))
+
+    if save_csv:
+        np.savetxt("F1_matrix.csv", F1_matrix, delimiter=",", fmt="%.4f")
+        np.savetxt("num_pred_mean.csv", num_pred_mean, delimiter=",", fmt="%d")
+
+    plot_F1_surface(thresholds, conf_thresholds, F1_matrix, save_img=save_img)
+
+    total_time = time.time() - total_start
+    print(f"Inferenza completata su {num_images} immagini in {total_time:.2f} sec")
+    return F1_matrix, num_pred_mean
+
+
+
 
 ##########################
 # FUNZIONE 7: GRAFICO 3D DELLA SUPERFICIE F1
 ##########################
-def plot_F1_surface(pck_thresholds, conf_thresholds, F1_matrix):
+def plot_F1_surface(pck_thresholds, conf_thresholds, F1_matrix, save_img):
     X, Y = np.meshgrid(pck_thresholds, conf_thresholds)
     fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection='3d')
@@ -331,4 +387,8 @@ def plot_F1_surface(pck_thresholds, conf_thresholds, F1_matrix):
     ax.view_init(elev=30, azim=50)
 
     plt.tight_layout()
+    
+    if save_img:
+        plt.savefig('F1_surface_plot.png')
+    
     plt.show()
