@@ -431,7 +431,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     # Imposta il dispositivo (GPU o CPU)
     model = model.to(device)
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device)) 
-    l1_loss = nn.L1Loss()
+    l1_loss = nn.SmoothL1Loss(beta=1.0)
     # dice_loss = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
@@ -469,10 +469,10 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                 bce = (bce * weight_map).mean()
 
                 probs = torch.sigmoid(outputs)
-                #l1 = l1_loss(probs, labels)
-                #l1 = (l1 * weight_map).mean()
+                l1 = l1_loss(probs, labels)
+                l1 = (l1 * weight_map).mean()
 
-                loss = bce
+                loss = bce + l1
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -502,10 +502,10 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                     bce = (bce * weight_map).mean()
 
                     probs = torch.sigmoid(outputs)
-                    # l1 = l1_loss(probs, labels)
-                    # l1 = (l1 * weight_map).mean()
+                    l1 = l1_loss(probs, labels)
+                    l1 = (l1 * weight_map).mean()
 
-                    loss = bce
+                    loss = bce + l1
 
                 train_bce_total += loss.item() * images.size(0)
                 # train_dice_total += dice.item() * images.size(0)
@@ -673,7 +673,7 @@ def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
 
 
 
-def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, threshold=None, npy=True, sigmoid=True):
+def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, show_heatmap=True, threshold=None, npy=True, sigmoid=True):
     """
     Esegue inferenza su un'immagine e restituisce heatmap + keypoints predetti.
 
@@ -697,12 +697,11 @@ def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, 
     keypoints : list of [x, y]
         Coordinate dei keypoints in pixel.
     """
-    # 1. Carica immagine grayscale e resize a 800x800
+    # 1. Carica immagine grayscale
     if npy==False:
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise ValueError(f"Immagine non trovata: {img_path}")
-        img = cv2.resize(img, (800, 800))
         img = img.astype('float32') / 255.0
     else:
         img = np.load(img_path)  # shape atteso (H, W)
@@ -721,61 +720,79 @@ def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, 
     # 4. Estrai keypoints
     keypoints = extract_predicted_keypoints(heatmap_pred, threshold=threshold, show_mask=show_mask)
     inference_time = time.time() - start_time
+    
+    if show_heatmap is True:
+        plt.imshow(heatmap_pred)
+        plt.title("Predicted Heatmap")
+        plt.colorbar()
+        plt.show()
 
     return heatmap_pred, keypoints, inference_time
 
 
 
 
-def compute_pck_metrics(gt_points, pred_points, thresholds):
+def compute_pck_metrics(pred_points, gt_points, thresholds):
     """
-    Calcola precision, recall e F1-score per varie soglie di distanza (PCK).
+    Calcola precision, recall e F1-score per varie soglie di distanza (PCK)
+    usando Hungarian matching ottimale.
 
     Parametri:
-    - gt_points (np.array di forma Nx2): Coordinate (x, y) dei keypoint ground truth.
-    - pred_points (np.array di forma Mx2): Coordinate (x, y) dei keypoint predetti.
-    - thresholds (iterabile o float/int): Soglie di distanza in pixel per il calcolo del PCK.
+    - pred_points (np.array Mx2): keypoint predetti (x, y)
+    - gt_points (np.array Nx2): keypoint ground truth (x, y)
+    - thresholds (iterabile o float/int): soglie di distanza in pixel
 
     Ritorna:
-    - precisioni (list): Precisione per ciascuna soglia.
-    - recall (list): Recall per ciascuna soglia.
-    - f1_scores (list): F1-score per ciascuna soglia.
+    - precisions (list): Precisione per ciascuna soglia
+    - recalls (list): Recall per ciascuna soglia
+    - f1_scores (list): F1-score per ciascuna soglia
     """
-
-    if len(gt_points) == 0 or len(pred_points) == 0:
-        n = len(thresholds) if hasattr(thresholds, "__iter__") else 1
-        return [0.0] * n, [0.0] * n, [0.0] * n
-
+    
     if not hasattr(thresholds, "__iter__"):
         thresholds = [thresholds]
 
+    if type(pred_points) is not np.ndarray or type(gt_points) is not np.ndarray:
+        pred_points = np.array(pred_points)
+        gt_points = np.array(gt_points)
+
+    if pred_points.ndim != 2 or gt_points.ndim != 2:
+        raise ValueError("Entrambi pred_points e gt_points devono avere forma (N, 2)")
+
+    # Caso limite: nessun punto
+    if len(gt_points) == 0 and len(pred_points) == 0:
+        n = len(thresholds)
+        return [1.0]*n, [1.0]*n, [1.0]*n
+    elif len(gt_points) == 0 or len(pred_points) == 0:
+        n = len(thresholds)
+        return [0.0]*n, [0.0]*n, [0.0]*n
+
     precisions, recalls, f1_scores = [], [], []
 
+    # Matrice distanze pred x gt
+    dists = np.linalg.norm(pred_points[:, None, :] - gt_points[None, :, :], axis=2)
+
     for t in thresholds:
-        # Calcola tutte le distanze pred-gt
-        dists = []
-        for i, pred in enumerate(pred_points):
-            for j, gt in enumerate(gt_points):
-                dist = np.linalg.norm(np.array(pred) - np.array(gt))
-                if dist < t:
-                    dists.append((dist, i, j))
+        # Matrice costi: penalizza oltre soglia
+        cost = dists.copy()
+        cost[cost > t] = 1e6  # alto costo per match invalidi
 
-        # Ordina per distanza crescente
-        dists.sort(key=lambda x: x[0])
+        # Hungarian assignment
+        row_ind, col_ind = linear_sum_assignment(cost)
 
-        matched_gt = set()
-        matched_pred = set()
         tp = 0
+        matched_pred = set()
+        matched_gt = set()
 
-        for dist, i, j in dists:
-            if i not in matched_pred and j not in matched_gt:
-                matched_pred.add(i)
-                matched_gt.add(j)
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < 1e6:  # match valido
                 tp += 1
+                matched_pred.add(r)
+                matched_gt.add(c)
 
-        fp = len(pred_points) - tp
-        fn = len(gt_points) - tp
+        fp = len(pred_points) - len(matched_pred)
+        fn = len(gt_points) - len(matched_gt)
 
+        # Metriche
         p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
@@ -785,8 +802,6 @@ def compute_pck_metrics(gt_points, pred_points, thresholds):
         f1_scores.append(f1)
 
     return precisions, recalls, f1_scores
-
-
 
 
 
@@ -898,7 +913,7 @@ def inference_dataset(
         pred_points = [kp[0] for kp in pred_points_and_cov]
         inference_time_total += inference_time
         precisions, recalls, f1s = compute_pck_metrics(
-            np.array(gt_points), np.array(pred_points), pixel_thresholds
+            np.array(pred_points), np.array(gt_points), pixel_thresholds
         )
         all_precisions += np.array(precisions)
         all_recalls += np.array(recalls)
