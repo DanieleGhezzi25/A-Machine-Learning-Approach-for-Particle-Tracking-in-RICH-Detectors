@@ -390,7 +390,7 @@ class DiceLoss(nn.Module):
 
 
 
-def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5, pos_weight=275, binary_threshold=0.97, f1_earlystopping=True):
+def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='cuda', patience=5, pos_weight=275, binary_threshold=0.97, f1_earlystopping=True, img_size=800):
     '''
     Funzione per addestrare il modello U-Net.
     Parameters
@@ -437,10 +437,10 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
     scaler = GradScaler()
     
     weight_center=20  # quanto pesare il centro
-    center_size=400     # lato del quadrato centrale in pixel
+    center_size=img_size//2     # lato del quadrato centrale in pixel
     
     # Crea la mappa di pesi una volta sola
-    H, W = 800, 800
+    H, W = img_size, img_size
     weight_map = torch.ones((1, H, W), dtype=torch.float32)
     start = (H - center_size) // 2
     end = start + center_size
@@ -469,10 +469,10 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                 bce = (bce * weight_map).mean()
 
                 probs = torch.sigmoid(outputs)
-                l1 = l1_loss(probs, labels)
-                l1 = (l1 * weight_map).mean()
+                #l1 = l1_loss(probs, labels)
+                #l1 = (l1 * weight_map).mean()
 
-                loss = bce + 0.3*l1
+                loss = bce
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -502,10 +502,10 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                     bce = (bce * weight_map).mean()
 
                     probs = torch.sigmoid(outputs)
-                    l1 = l1_loss(probs, labels)
-                    l1 = (l1 * weight_map).mean()
+                    # l1 = l1_loss(probs, labels)
+                    # l1 = (l1 * weight_map).mean()
 
-                    loss = bce + 0.3 * l1
+                    loss = bce
 
                 train_bce_total += loss.item() * images.size(0)
                 # train_dice_total += dice.item() * images.size(0)

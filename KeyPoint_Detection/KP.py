@@ -6,6 +6,7 @@ import time
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import auc
+import torch
 
 ##########################
 # FUNZIONE 1: INFERENZA SU IMMAGINE SINGOLA
@@ -226,6 +227,7 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
 
     sum_prec, sum_rec, sum_f1 = [np.zeros(len(thresholds)) for _ in range(3)]
     total_time, total_images = 0.0, 0
+    time_list = []
 
     image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png'))])
 
@@ -236,6 +238,7 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
         start = time.time()
         results = model.predict(source=image_path, conf=confidence, save=False, verbose=False)
         total_time += time.time() - start
+        time_list.append(total_time)
 
         if not results:
             continue
@@ -261,103 +264,107 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
     mean_rec = sum_rec / total_images
     mean_f1 = sum_f1 / total_images
     avg_time = total_time / total_images
+    std_time = np.std(time_list)
 
     print(f"\n== Risultati medi su {total_images} immagini ==")
     for i, t in enumerate(thresholds):
         print(f"Threshold {t:.1f}px ==> Precision: {mean_prec[i]:.3f} | Recall: {mean_rec[i]:.3f} | F1: {mean_f1[i]:.3f}")
-    print(f"Inferenza media: {avg_time:.3f} sec/immagine")
+    print(f"Tempo di Inferenza: ( {avg_time*1000:.3f} ± {std_time*1000:.3f} ) ms/immagine")
 
     return {
         "thresholds": thresholds,
         "precision": mean_prec,
         "recall": mean_rec,
         "f1": mean_f1,
-        "avg_inference_time_sec": avg_time
+        "avg_inference_time_sec": avg_time,
+        "std_inference_time_sec": std_time
     }
     
 
 
 ##########################
-# FUNZIONE 6: INFERENZA SU INTERO DATASET + mAP + confidence
+# FUNZIONE 6: INFERENZA SU INTERO DATASET
 ##########################
 def inference_F1map(images_dir, labels_dir, model_path,
                     img_size=420,
-                    thresholds=np.arange(3, 7, 1),
-                    conf_thresholds=np.arange(0.2, 0.8, 0.2),
-                    save_csv=True, save_img=True):
+                    thresholds=np.arange(3, 7, 1),           # soglie PCK in pixel
+                    conf_thresholds=np.arange(0.2, 0.8, 0.2), # confidence YOLO
+                    device=0, save_csv=True, save_img=True):
     """
-    Esegue inferenza su tutte le immagini di una directory con un modello YOLO usando GPU, calcola
-    F1-score medio su soglie multiple di threshold PCK e confidenza, e costruisce una matrice F1 2D.
-    Restituisce anche il numero medio di punti predetti per ogni conf_threshold.
-
-    Parameters:
-    - images_dir (str): Path directory immagini.
-    - labels_dir (str): Path directory file ground truth.
-    - model_path (str): Percorso modello YOLO.
-    - thresholds (np.array): Soglie PCK in pixel.
-    - conf_thresholds (np.array): Soglie di confidenza YOLO.
-    - save_csv (bool): Se True salva F1_matrix in CSV.
-    - save_img (bool): Se True salva immagine 3D della superficie F1.
-    
-    Returns:
-    - F1_matrix (np.array): Matrice 2D F1 medio per ogni combinazione threshold/conf.
-    - num_pred_mean (np.array): Numero medio di keypoints predetti per ciascuna conf_threshold.
+    Calcola la matrice F1(confidenza, threshold_px). 
+    Ogni cella è l'F1 medio calcolato eseguendo la predict con quella 'confidence'
+    impostata nel modello, e valutando con PCK (Hungarian) a quel 'threshold' in pixel.
+    Inoltre calcola il numero medio di keypoints predetti per immagine (per confidence).
     """
 
     model = YOLO(model_path)
-    F1_matrix = np.zeros((len(conf_thresholds), len(thresholds)))
-    num_pred_sum = np.zeros(len(conf_thresholds))
-    num_images = 0
 
-    image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg','.png'))])
+    # Lista immagini
+    image_files = sorted([f for f in os.listdir(images_dir)
+                          if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+    image_paths = [os.path.join(images_dir, f) for f in image_files]
 
-    total_start = time.time()
-    for image_name in image_files:
-        image_path = os.path.join(images_dir, image_name)
-        label_path = os.path.join(labels_dir, os.path.splitext(image_name)[0] + ".txt")
-        gt_points = keypoints_from_txt(label_path,img_size=img_size)
-        if len(gt_points) == 0:
-            continue
+    F1_matrix = np.zeros((len(conf_thresholds), len(thresholds)), dtype=float)
+    denom = np.zeros_like(F1_matrix, dtype=int)  # contatori per average
 
-        results = model.predict(source=image_path, conf=0.0, save=False, verbose=False)
-        if not results:
-            continue
-        pred_points = keypoints_from_result(results[0])
-        if len(pred_points) == 0:
-            continue
+    avg_preds_per_conf = np.zeros(len(conf_thresholds), dtype=float)
+    denom_preds = np.zeros(len(conf_thresholds), dtype=int)
 
-        conf_values = results[0].keypoints.conf.cpu().numpy().flatten()
+    t0 = time.time()
+    for i, conf in enumerate(conf_thresholds):
+        print(f"\n[INFO] Calcolo con conf={conf:.2f} ...")
 
-        for i, conf_thr in enumerate(conf_thresholds):
-            # Filtra predizioni per conf_threshold
-            filtered_pred = np.array([kp for kp, conf in zip(pred_points, conf_values) if conf >= conf_thr])
-            num_pred_sum[i] += len(filtered_pred)
+        for img_path in image_paths:
+            # Predict UNA immagine alla volta
+            results = model.predict(source=img_path,
+                                    conf=float(conf),
+                                    save=False, verbose=False,
+                                    device=device, stream=False)
 
-            if len(filtered_pred) == 0:
+            # Ultralytics restituisce una lista di Results -> prendi il primo
+            res = results[0]
+
+            gt_path = os.path.join(labels_dir, os.path.splitext(os.path.basename(img_path))[0] + ".txt")
+            gt = keypoints_from_txt(gt_path, img_size=img_size)
+            pred = keypoints_from_result([res])
+
+            # conta keypoints predetti (indipendente da threshold)
+            avg_preds_per_conf[i] += len(pred)
+            denom_preds[i] += 1
+
+            # calcolo F1 solo se c'è GT
+            if gt.size == 0:
                 continue
 
-            for j, pck_thr in enumerate(thresholds):
-                _, _, f1 = compute_pck_metrics(filtered_pred, gt_points, [pck_thr])
-                F1_matrix[i, j] += f1[0]
+            _, _, f1s = compute_pck_metrics(pred, gt, thresholds)
+            F1_matrix[i, :] += np.array(f1s, dtype=float)
+            denom[i, :] += 1
 
-        num_images += 1
+            # Libera la GPU per sicurezza
+            del res, results
+            torch.cuda.empty_cache()
 
-    # Medie
-    if num_images > 0:
-        F1_matrix /= num_images
-        num_pred_mean = num_pred_sum / num_images
-    else:
-        num_pred_mean = np.zeros(len(conf_thresholds))
+    # average
+    denom_safe = np.maximum(denom, 1)
+    F1_matrix = F1_matrix / denom_safe
+    avg_preds_per_conf = avg_preds_per_conf / np.maximum(denom_preds, 1)
 
     if save_csv:
         np.savetxt("F1_matrix.csv", F1_matrix, delimiter=",", fmt="%.4f")
-        np.savetxt("num_pred_mean.csv", num_pred_mean, delimiter=",", fmt="%d")
+        np.savetxt("F1_axis_thresholds_px.csv", np.asarray(thresholds), delimiter=",", fmt="%.3f")
+        np.savetxt("F1_axis_confidences.csv", np.asarray(conf_thresholds), delimiter=",", fmt="%.3f")
+        np.savetxt("avg_preds_per_conf.csv", avg_preds_per_conf, delimiter=",", fmt="%.4f")
 
+    elapsed = time.time() - t0
+    print(f"\nCalcolata F1 grid in {elapsed:.2f}s su {len(image_paths)} immagini.")
+    print("Media keypoints predetti per confidence:")
+    for c, n in zip(conf_thresholds, avg_preds_per_conf):
+        print(f"  conf={c:.2f} -> {n:.2f} keypoints/image")
+        
     plot_F1_surface(thresholds, conf_thresholds, F1_matrix, save_img=save_img)
 
-    total_time = time.time() - total_start
-    print(f"Inferenza completata su {num_images} immagini in {total_time:.2f} sec")
-    return F1_matrix, num_pred_mean
+    return F1_matrix, avg_preds_per_conf
+
 
 
 
