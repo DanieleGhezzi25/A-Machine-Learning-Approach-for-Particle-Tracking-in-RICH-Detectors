@@ -472,7 +472,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                 l1 = l1_loss(probs, labels)
                 l1 = (l1 * weight_map).mean()
 
-                loss = bce + l1
+                loss = bce + 2*l1
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -505,7 +505,7 @@ def train_unet(model, train_loader, val_loader, num_epochs=50, lr=1e-3, device='
                     l1 = l1_loss(probs, labels)
                     l1 = (l1 * weight_map).mean()
 
-                    loss = bce + l1
+                    loss = bce + 2*l1
 
                 train_bce_total += loss.item() * images.size(0)
                 # train_dice_total += dice.item() * images.size(0)

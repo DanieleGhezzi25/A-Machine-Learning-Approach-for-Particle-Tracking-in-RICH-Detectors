@@ -207,20 +207,21 @@ def compute_pck_metrics(pred_points, gt_points, thresholds):
 def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_size=420,
                         thresholds=[2,4,6], show=False, save=False, output_dir="output"):
     """
-    Esegue inferenza su tutte le immagini e calcola le metriche su threshold multiple.
-    La confidence è fissata.
+    Perform inference on all images and compute metrics for multiple thresholds.
+    The confidence is fixed.
 
     Parameters:
-    - images_dir (str): Directory immagini.
-    - labels_dir (str): Directory ground truth.
-    - model_path (str): YOLO model.
-    - confidence (float): Soglia di confidenza per le predizioni.
-    - thresholds (list): soglie in pixel.
-    - show, save (bool): Visualizzazione/salvataggio immagini annotate.
-    - output_dir (str): Cartella per immagini annotate.
+    - images_dir (str): Directory of images.
+    - labels_dir (str): Directory of ground truth labels.
+    - model_path (str): YOLO model path.
+    - confidence (float): Confidence threshold for predictions.
+    - thresholds (list): Pixel thresholds for evaluation.
+    - show, save (bool): Display/save annotated images.
+    - output_dir (str): Directory for saving annotated images.
 
     Returns:
-    - dict con medie: precision, recall, f1, pck, mAP, tempo medio.
+    - dict with averages: precision, recall, f1, pck, mAP, average inference time,
+      average predicted keypoints per image.
     """
     os.makedirs(output_dir, exist_ok=True)
     model = YOLO(model_path)
@@ -228,6 +229,9 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
     sum_prec, sum_rec, sum_f1 = [np.zeros(len(thresholds)) for _ in range(3)]
     total_time, total_images = 0.0, 0
     time_list = []
+
+    # per keypoints
+    keypoints_count_list = []
 
     image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png'))])
 
@@ -237,14 +241,18 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
 
         start = time.time()
         results = model.predict(source=image_path, conf=confidence, save=False, verbose=False)
-        total_time += time.time() - start
-        time_list.append(total_time)
+        elapsed = time.time() - start
+        total_time += elapsed
+        time_list.append(elapsed)
 
         if not results:
             continue
 
-        pred = keypoints_from_result(results[0])  # <-- tua funzione
-        gt = keypoints_from_txt(label_path, img_size=img_size)       # <-- tua funzione
+        pred = keypoints_from_result(results[0])
+        gt = keypoints_from_txt(label_path, img_size=img_size)
+
+        # salva numero keypoints predetti
+        keypoints_count_list.append(len(pred))
 
         if len(gt) == 0 and len(pred) == 0:
             continue
@@ -264,12 +272,17 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
     mean_rec = sum_rec / total_images
     mean_f1 = sum_f1 / total_images
     avg_time = total_time / total_images
-    std_time = np.std(time_list)
+    std_time = np.std(time_list) / np.sqrt(total_images)
 
-    print(f"\n== Risultati medi su {total_images} immagini ==")
+    # numero medio keypoints predetti
+    avg_kpts = np.mean(keypoints_count_list)
+    std_kpts = np.std(keypoints_count_list) / np.sqrt(total_images)
+
+    print(f"\n== Average results over {total_images} images ==")
     for i, t in enumerate(thresholds):
         print(f"Threshold {t:.1f}px ==> Precision: {mean_prec[i]:.3f} | Recall: {mean_rec[i]:.3f} | F1: {mean_f1[i]:.3f}")
-    print(f"Tempo di Inferenza: ( {avg_time*1000:.3f} ± {std_time*1000:.3f} ) ms/immagine")
+    print(f"Inference time: ( {avg_time*1000:.3f} ± {std_time*1000:.3f} ) ms/image")
+    print(f"Predicted keypoints: ( {avg_kpts:.2f} ± {std_kpts:.2f} ) per image")
 
     return {
         "thresholds": thresholds,
@@ -277,7 +290,9 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
         "recall": mean_rec,
         "f1": mean_f1,
         "avg_inference_time_sec": avg_time,
-        "std_inference_time_sec": std_time
+        "std_inference_time_sec": std_time,
+        "avg_pred_keypoints": avg_kpts,
+        "std_pred_keypoints": std_kpts
     }
     
 
