@@ -683,6 +683,7 @@ def inference_image(img_path, model, device='cuda', show_mask=False, show_heatma
         plt.title("Predicted Heatmap")
         plt.colorbar()
         plt.show()
+        
 
     return heatmap_pred, keypoints, inference_time
 
@@ -706,10 +707,9 @@ def compute_pck_metrics(pred_points, gt_points, thresholds):
     - recalls (list): Recall per ciascuna soglia
     - f1_scores (list): F1-score per ciascuna soglia
     """
-
-    # Check input
-    assert pred_points.shape[1] == 2 and gt_points.shape[1] == 2, \
-        "Sia pred_points che gt_points devono avere forma (N, 2)"
+    
+    pred_points = np.array(pred_points, dtype=float)
+    gt_points = np.array(gt_points, dtype=float)
     
     if not hasattr(thresholds, "__iter__"):
         thresholds = [thresholds]
@@ -839,8 +839,7 @@ def inference_dataset(
     os.makedirs(output_keypoints_dir, exist_ok=True)
     os.makedirs(output_heatmaps_dir, exist_ok=True)
 
-    model_cls = UNetWithAttention
-    model = model_cls(in_channels=1, out_channels=1).to(device)
+    model = UNetWithAttention(in_channels=1, out_channels=1).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -856,7 +855,8 @@ def inference_dataset(
     all_recalls = np.zeros(len(pixel_thresholds))
     all_f1s = np.zeros(len(pixel_thresholds))
     all_f1_list = []  
-    inference_time_total = 0.0
+    inference_time_list = []
+    number_predictedKP = []
     count = 0
 
     for img_path in image_paths:
@@ -870,7 +870,8 @@ def inference_dataset(
             img_path, model, device=device, threshold=threshold, show_mask=show_mask, beta=beta, show_heatmap=False
         )
         pred_points = [kp[0] for kp in pred_points_and_cov]
-        inference_time_total += inference_time
+        number_predictedKP.append(len(pred_points))
+        inference_time_list.append(inference_time)
         precisions, recalls, f1s = compute_pck_metrics(
             np.array(pred_points), np.array(gt_points), pixel_thresholds
         )
@@ -917,7 +918,9 @@ def inference_dataset(
     mean_f1s = (all_f1s / count).tolist()
     std_f1 = np.std(all_f1_array, axis=0).tolist()
     stdmean_f1 = (np.std(all_f1_array, axis=0) / np.sqrt(count)).tolist()
-    std_time = (np.std(inference_time_total) / np.sqrt(count)).tolist()
+    
+    inference_time_list = np.array(inference_time_list)
+    number_predictedKP = np.array(number_predictedKP)
 
     return {
         'precision': mean_precisions,
@@ -925,8 +928,11 @@ def inference_dataset(
         'f1': mean_f1s,
         'std_f1': std_f1,
         'stdmean_f1': stdmean_f1,
-        'inference_time': inference_time_total / count,
-        'std_time': std_time
+        'inference_time_array': inference_time_list,
+        'inference_time': np.mean(inference_time_list),
+        'std_time': np.std(inference_time_list)/np.sqrt(len(inference_time_list)),
+        'mean_number_predictedKP': np.mean(number_predictedKP),
+        'std_number_predictedKP': np.std(number_predictedKP)/np.sqrt(len(number_predictedKP))
     }
     
     
@@ -936,7 +942,7 @@ def binary_threshold_study(dataset_path, model_path, log_dir, binary_threshold =
     output_metrics_file = os.path.join(log_dir, 'metrics_log.txt')
     with open(output_metrics_file, 'w') as f:
         # Intestazione colonne
-        f.write("CoeffBinThresh\tPixelThresh\tPrecision\tRecall\tF1\n")
+        f.write("CoeffBinThresh\tPixelThresh\tPrecision\tRecall\tF1\tTime\tStdTime\n")
 
         for i in binary_threshold:
             print(f"==> Coefficient Binary Threshold: {i:.3f}")
@@ -965,4 +971,128 @@ def binary_threshold_study(dataset_path, model_path, log_dir, binary_threshold =
                 print(f"Binary Threshold {i}: Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f} @{px_thresh}px | Time: ({time*1000:.4f} ± {std_time*1000:.4f}) ms")
 
             print("")
-            
+
+
+
+
+def inference_F1map_unet(
+    dataset_path,
+    model_path,
+    img_size=800,
+    pixel_thresholds=np.arange(2, 7, 2),          # soglie PCK in pixel
+    binary_thresholds=np.arange(0.85, 0.996, 0.01), # soglie binarie heatmap
+    device='cuda',
+    save_csv=True,
+    save_img=True,
+    beta=2
+):
+    """
+    Calcola la matrice F1(binary_threshold, pixel_threshold).
+    Ogni cella è l'F1 medio calcolato eseguendo la predict con quella 'binary_threshold'
+    per estrarre keypoints dalla heatmap, e valutando con PCK (Hungarian) a quel 'pixel_threshold'.
+    Inoltre calcola il numero medio di keypoints predetti per immagine (per binary_threshold).
+    """
+
+    # Carica modello
+    model = UNetWithAttention(in_channels=1, out_channels=1).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # Cartelle immagini e ground truth
+    img_dir = os.path.join(dataset_path, 'images', 'val')
+    csv_dir = os.path.join(dataset_path, 'centers', 'val')
+    image_paths = sorted([
+        os.path.join(img_dir, f) for f in os.listdir(img_dir)
+        if f.endswith('.png') or f.endswith('.npy')
+    ])
+
+    F1_matrix = np.zeros((len(binary_thresholds), len(pixel_thresholds)), dtype=float)
+    denom = np.zeros_like(F1_matrix, dtype=int)
+
+    avg_preds_per_bin = np.zeros(len(binary_thresholds), dtype=float)
+    denom_preds = np.zeros(len(binary_thresholds), dtype=int)
+
+    t0 = time.time()
+    for i, bin_thr in enumerate(binary_thresholds):
+        print(f"\n[INFO] Calcolo con binary_threshold={bin_thr:.3f} ...")
+
+        for img_path in image_paths:
+            base_name = os.path.splitext(os.path.basename(img_path))[0]
+            csv_path = os.path.join(csv_dir, base_name + '_centers.csv')
+            if not os.path.exists(csv_path):
+                continue
+
+            # Inferenza
+            heatmap, pred_points_and_cov, _ = inference_image(
+                img_path, model, device=device, threshold=bin_thr,
+                show_mask=False, beta=beta, show_heatmap=False
+            )
+            pred_points = [kp[0] for kp in pred_points_and_cov]
+            gt_points = load_keypoints_from_csv(csv_path)
+
+            # Conta keypoints predetti (indipendente da pixel threshold)
+            avg_preds_per_bin[i] += len(pred_points)
+            denom_preds[i] += 1
+
+            if len(gt_points) == 0:
+                continue
+
+            # PCK
+            _, _, f1s = compute_pck_metrics(pred_points, gt_points, pixel_thresholds)
+            F1_matrix[i, :] += np.array(f1s, dtype=float)
+            denom[i, :] += 1
+
+            torch.cuda.empty_cache()
+
+    # Averages
+    denom_safe = np.maximum(denom, 1)
+    F1_matrix = F1_matrix / denom_safe
+    avg_preds_per_bin = avg_preds_per_bin / np.maximum(denom_preds, 1)
+
+    # Salvataggio CSV
+    if save_csv:
+        np.savetxt("F1_matrix_unet.csv", F1_matrix, delimiter=",", fmt="%.4f")
+        np.savetxt("F1_axis_pixel_thresholds.csv", np.asarray(pixel_thresholds), delimiter=",", fmt="%.3f")
+        np.savetxt("F1_axis_binary_thresholds.csv", np.asarray(binary_thresholds), delimiter=",", fmt="%.3f")
+        np.savetxt("avg_preds_per_binary_threshold.csv", avg_preds_per_bin, delimiter=",", fmt="%.4f")
+
+    elapsed = time.time() - t0
+    print(f"\nCalcolata F1 grid in {elapsed:.2f}s su {len(image_paths)} immagini.")
+    print("Media keypoints predetti per binary_threshold:")
+    for c, n in zip(binary_thresholds, avg_preds_per_bin):
+        print(f"  bin_thr={c:.3f} -> {n:.2f} keypoints/image")
+
+    # Plot superficie
+    plot_F1_surface(pixel_thresholds, binary_thresholds, F1_matrix, save_img=save_img)
+
+    return F1_matrix, avg_preds_per_bin
+
+
+
+def plot_F1_surface(pck_thresholds, binary_thresholds, F1_matrix, save_img):
+    X, Y = np.meshgrid(pck_thresholds, binary_thresholds)
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Superficie colorata
+    surf = ax.plot_surface(X, Y, F1_matrix, cmap='viridis', edgecolor='k', alpha=0.8)
+    
+    # Label assi con valori arrotondati per chiarezza
+    ax.set_xlabel('Threshold (px)')
+    ax.set_ylabel('Binary Threshold')
+    ax.set_zlabel('F1')
+    ax.set_title('F1 Score Surface Plot')
+
+    # Griglia e colorbar
+    ax.grid(True)
+    fig.colorbar(surf, shrink=0.5, aspect=10)
+
+    # Ruota leggermente la vista per migliorare la leggibilità
+    ax.view_init(elev=30, azim=50)
+
+    plt.tight_layout()
+    
+    if save_img:
+        plt.savefig('F1_surface_plot.png')
+    
+    plt.show()
