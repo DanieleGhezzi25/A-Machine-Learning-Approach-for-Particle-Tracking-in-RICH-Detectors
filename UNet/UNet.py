@@ -709,7 +709,7 @@ def power_sharpening(sigmoid_map, gamma=2.0, renormalize=False):
 
 
 
-def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, show_heatmap=True, threshold=None, npy=True, sigmoid=True, beta=2):
+def infer_keypoints_from_image(img_path, model, device='cuda', show_mask=False, show_heatmap=True, threshold=None, npy=True, sigmoid=True, beta=1):
     """
     Esegue inferenza su un'immagine e restituisce heatmap + keypoints predetti.
 
@@ -774,6 +774,8 @@ def compute_pck_metrics(pred_points, gt_points, thresholds):
     """
     Calcola precision, recall e F1-score per varie soglie di distanza (PCK)
     usando Hungarian matching ottimale.
+    In pratica, dovendo minimizzare la matrice dei costi (cioè delle distanze tra predicted e gt), 
+    accoppia i punti predicted e gt che sono più vicini fra loro (solo in questo modo il costo totale si minimizza!). 
 
     Parametri:
     - pred_points (np.array Mx2): keypoint predetti (x, y)
@@ -785,10 +787,9 @@ def compute_pck_metrics(pred_points, gt_points, thresholds):
     - recalls (list): Recall per ciascuna soglia
     - f1_scores (list): F1-score per ciascuna soglia
     """
-
-    # Check input
-    assert pred_points.shape[1] == 2 and gt_points.shape[1] == 2, \
-        "Sia pred_points che gt_points devono avere forma (N, 2)"
+    
+    pred_points = np.array(pred_points, dtype=float)
+    gt_points = np.array(gt_points, dtype=float)
     
     if not hasattr(thresholds, "__iter__"):
         thresholds = [thresholds]
@@ -1160,7 +1161,7 @@ def train_unet_with_patches(model, train_loader, val_loader, num_epochs=50, lr=1
                         
                         if patch == 'center':
                             bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch].clone().detach().to(device))
-                            loss = 0.7 * bce_loss(outputs, labels) + 0.3 * dice_loss(outputs, labels)
+                            loss = bce_loss(outputs, labels) # + 0.3 * dice_loss(outputs, labels)
                         elif patch == 'frame':
                             bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[patch].clone().detach().to(device))
                             loss = bce_loss(outputs, labels)

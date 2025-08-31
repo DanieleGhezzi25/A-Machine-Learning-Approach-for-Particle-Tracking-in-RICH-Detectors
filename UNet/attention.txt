@@ -1,4 +1,0 @@
-aggiungere soft attention alla rete  neurale:
-https://www.youtube.com/watch?v=KOF38xAvo8I
-
-articolo di UNet originale: arXiv:1505.04597
