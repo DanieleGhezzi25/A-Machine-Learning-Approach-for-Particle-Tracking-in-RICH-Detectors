@@ -680,8 +680,9 @@ def inference_image(img_path, model, device='cuda', show_mask=False, show_heatma
     
     if show_heatmap is True:
         plt.imshow(heatmap_pred)
-        plt.title("Predicted Heatmap")
-        plt.colorbar()
+        # plt.title("Predicted Heatmap")
+        # plt.colorbar()
+        plt.axis('off')
         plt.show()
         
 
