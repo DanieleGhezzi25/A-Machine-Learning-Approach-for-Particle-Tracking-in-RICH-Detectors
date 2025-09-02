@@ -589,7 +589,8 @@ def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
     
     if show_mask is True:
         plt.imshow(binary, cmap='gray')
-        plt.title("Binarized Heatmap")
+        #plt.title("Binarized Heatmap")
+        plt.axis('off')
         plt.show()
 
     # Trova le componenti connesse (OpenCV)
@@ -802,7 +803,7 @@ def inference_dataset(
     pixel_thresholds=[2, 4, 6],
     threshold=0.97,
     show_mask=False,
-    beta=2,
+    beta=1,
     save_images=False,
     save_heatmaps=False
 ):
