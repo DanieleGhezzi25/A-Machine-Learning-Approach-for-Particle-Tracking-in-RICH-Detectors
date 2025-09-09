@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import auc
 import torch
+from matplotlib.colors import ListedColormap
 
 ##########################
 # FUNZIONE 1: INFERENZA SU IMMAGINE SINGOLA
@@ -147,6 +148,9 @@ def compute_pck_metrics(pred_points, gt_points, thresholds):
     - f1_scores (list): F1-score per ciascuna soglia
     """
 
+    pred_points = np.array(pred_points)
+    gt_points = np.array(gt_points)
+
     # Check input
     assert pred_points.shape[1] == 2 and gt_points.shape[1] == 2, \
         "Sia pred_points che gt_points devono avere forma (N, 2)"
@@ -205,7 +209,8 @@ def compute_pck_metrics(pred_points, gt_points, thresholds):
 # FUNZIONE 5: INFERENZA SU INTERO DATASET + mAP
 ##########################
 def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_size=420,
-                        thresholds=[2,4,6], show=False, save=False, output_dir="output"):
+                        thresholds=[2,4,6], show=False, save=False, output_dir="output",
+                        x_interval=None, y_interval=None):
     """
     Perform inference on all images and compute metrics for multiple thresholds.
     The confidence is fixed.
@@ -229,6 +234,16 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
     sum_prec, sum_rec, sum_f1 = [np.zeros(len(thresholds)) for _ in range(3)]
     total_time, total_images = 0.0, 0
     time_list = []
+    all_red_precision = []
+    all_red_recall = []
+    all_red_f1 = []
+    all_peripheral_precision = []
+    all_peripheral_recall = []
+    all_peripheral_f1 = []
+    number_predictedKP_centered = []
+    number_predictedKP_peripheral = []
+    number_gtKP_centered = []
+    number_gtKP_peripheral = []
 
     # per keypoints
     keypoints_count_list = []
@@ -258,7 +273,23 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
             continue
 
         prec, rec, f1 = map(np.array, compute_pck_metrics(pred, gt, thresholds))
-
+        
+        if x_interval is None and y_interval is None:
+            x_interval = (img_size//4, 3*img_size//4)
+            y_interval = (img_size//4, 3*img_size//4)
+            red_precision, red_recall, red_f1, number_predKP_centered, number_grtKP_centered = restricted_pck_metrics(pred, gt, thresholds, x_interval, y_interval)
+            per_precision, per_recall, per_f1, number_predKP_peripheral, number_grtKP_peripheral = peripheral_pck_metrics(pred, gt, thresholds, x_interval, y_interval)
+            all_red_precision.append(red_precision)
+            all_red_recall.append(red_recall)
+            all_red_f1.append(red_f1)
+            all_peripheral_precision.append(per_precision)
+            all_peripheral_recall.append(per_recall)
+            all_peripheral_f1.append(per_f1)
+            number_predictedKP_centered.append(number_predKP_centered)
+            number_gtKP_centered.append(number_grtKP_centered)
+            number_predictedKP_peripheral.append(number_predKP_peripheral)
+            number_gtKP_peripheral.append(number_grtKP_peripheral)
+            
         sum_prec += prec
         sum_rec  += rec
         sum_f1   += f1
@@ -278,6 +309,18 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
     avg_kpts = np.mean(keypoints_count_list)
     std_kpts = np.std(keypoints_count_list) / np.sqrt(total_images)
 
+    mean_red_precision = (np.mean(all_red_precision, axis=0)).tolist() if all_red_precision else None 
+    mean_red_recall = (np.mean(all_red_recall, axis=0)).tolist() if all_red_recall else None
+    mean_red_f1 = (np.mean(all_red_f1, axis=0)).tolist() if all_red_f1 else None
+    mean_number_predKP_centered = (np.mean(number_predictedKP_centered)) if number_predictedKP_centered else None
+    mean_number_gtKP_centered = (np.mean(number_gtKP_centered)) if number_gtKP_centered else None
+
+    mean_per_precision = (np.mean(all_peripheral_precision, axis=0)).tolist() if all_peripheral_precision else None
+    mean_per_recall = (np.mean(all_peripheral_recall, axis=0)).tolist() if all_peripheral_recall else None
+    mean_per_f1 = (np.mean(all_peripheral_f1, axis=0)).tolist() if all_peripheral_f1 else None
+    mean_number_predKP_peripheral = (np.mean(number_predictedKP_peripheral)) if number_predictedKP_peripheral else None
+    mean_number_gtKP_peripheral = (np.mean(number_gtKP_peripheral)) if number_gtKP_peripheral else None
+        
     print(f"\n== Average results over {total_images} images ==")
     for i, t in enumerate(thresholds):
         print(f"Threshold {t:.1f}px ==> Precision: {mean_prec[i]:.3f} | Recall: {mean_rec[i]:.3f} | F1: {mean_f1[i]:.3f}")
@@ -292,7 +335,17 @@ def inference_setImages(images_dir, labels_dir, model_path, confidence=0.5, img_
         "avg_inference_time_sec": avg_time,
         "std_inference_time_sec": std_time,
         "avg_pred_keypoints": avg_kpts,
-        "std_pred_keypoints": std_kpts
+        "std_pred_keypoints": std_kpts,
+        'mean_red_precision': mean_red_precision,
+        'mean_red_recall': mean_red_recall,
+        'mean_red_f1': mean_red_f1,
+        'mean_number_predKP_centered': mean_number_predKP_centered,
+        'mean_number_gtKP_centered': mean_number_gtKP_centered,
+        'mean_per_precision': mean_per_precision,
+        'mean_per_recall': mean_per_recall,
+        'mean_per_f1': mean_per_f1,
+        'mean_number_predKP_peripheral': mean_number_predKP_peripheral,
+        'mean_number_gtKP_peripheral': mean_number_gtKP_peripheral
     }
     
 
@@ -414,3 +467,92 @@ def plot_F1_surface(pck_thresholds, conf_thresholds, F1_matrix, save_img):
         plt.savefig('F1_surface_plot.png')
     
     plt.show()
+
+
+
+def restricted_pck_metrics(pred_kp, gt_kp, thresholds, x_interval, y_interval):
+    # seleziono i kp al centro dell'immagine
+    pred_kp_centered = [kp for kp in pred_kp if x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1]]
+    gt_kp_centered = [kp for kp in gt_kp if x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1]]
+    precision, recall, f1 = compute_pck_metrics(pred_kp_centered, gt_kp_centered, thresholds)
+    number_pred_kp_centered = len(pred_kp_centered)
+    number_gt_kp_centered = len(gt_kp_centered)
+    return precision, recall, f1, number_pred_kp_centered, number_gt_kp_centered
+
+def peripheral_pck_metrics(pred_kp, gt_kp, thresholds, x_interval, y_interval):
+    # seleziono i kp esterni al centro dell'immagine
+    pred_kp_peripheral = [kp for kp in pred_kp if not (x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1])]
+    gt_kp_peripheral = [kp for kp in gt_kp if not (x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1])]
+    precision, recall, f1 = compute_pck_metrics(pred_kp_peripheral, gt_kp_peripheral, thresholds)
+    number_pred_kp_peripheral = len(pred_kp_peripheral)
+    number_gt_kp_peripheral = len(gt_kp_peripheral)
+    return precision, recall, f1, number_pred_kp_peripheral, number_gt_kp_peripheral
+
+
+
+def show_with_MCpoints_new(results, txt_path, img_path, title="Immagine con keypoints",
+                            show_image=True, save_image=False, output_path='inference.jpg',
+                            img_size=(420, 420), threshold=10):
+    """
+    Mostra keypoints predetti (rosso) e ground truth (azzurro) su immagine JPG/PNG
+    con pixel sopra soglia neri e sfondo bianco, stile identico a img_kp_pred_and_gr_new.
+
+    Args:
+        results (list): Risultati YOLO, con attributo keypoints.xy
+        txt_path (str): Percorso file txt GT
+        img_path (str): Percorso immagine JPG/PNG
+        title (str): Titolo plot
+        show_image (bool): Mostra immagine
+        save_image (bool): Salva immagine in output_path
+        output_path (str): Path per salvare immagine
+        img_size (tuple): Dimensione immagine GT normalizzata (width, height)
+        threshold (int): soglia per evidenziare pixel in scala 0-255
+    """
+    # Carico immagine in scala di grigi
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Immagine non trovata: {img_path}")
+    
+    # Creo maschera binaria: pixel sopra soglia = 1, sfondo = NaN
+    mask = np.where(img > threshold, 1, np.nan)
+
+    # Colormap: sfondo bianco, pixel neri
+    cmap = ListedColormap(['lightgray', 'black'])
+    cmap.set_bad(color='lightgray', alpha=0.4)
+
+    plt.figure(figsize=(8, 8))
+    plt.imshow(mask, cmap=cmap, vmin=0, vmax=1, interpolation='nearest')
+
+    # Keypoints GT
+    keypoints_gt = np.loadtxt(txt_path, usecols=(-3, -2))
+    if keypoints_gt is not None and len(keypoints_gt) > 0:
+        for x, y in keypoints_gt:
+            x = x * img_size[0]
+            y = y * img_size[1]
+            plt.plot(x, y, 'o', markersize=5,
+                     markeredgewidth=0.5, markeredgecolor='white', color='deepskyblue')
+
+    # Keypoints predetti
+    keypoints_pred = []
+    for r in results:
+        if r.keypoints is not None:
+            for kp in r.keypoints.xy:
+                for x, y in kp:
+                    if hasattr(x, 'cpu'):
+                        x = x.cpu().numpy()
+                    if hasattr(y, 'cpu'):
+                        y = y.cpu().numpy()
+                    keypoints_pred.append((x, y))
+
+    if len(keypoints_pred) > 0:
+        for x, y in keypoints_pred:
+            plt.plot(x, y, 'o', markersize=2, color='red')
+
+    plt.axis('off')
+    plt.title(title)
+
+    if show_image:
+        plt.show()
+    if save_image:
+        plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
+

@@ -15,12 +15,16 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import torchvision
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import cv2
 from scipy.optimize import linear_sum_assignment
 import time
+import kornia
+import kornia.contrib as kc
+from matplotlib.colors import ListedColormap
 
 
 
@@ -556,62 +560,68 @@ def load_keypoints_from_csv(csv_path):
 
 
 
-def extract_predicted_keypoints(heatmap, threshold=None, show_mask=False):
+def extract_predicted_keypoints(heatmap, threshold=0.5, compute_cov=False, device="cuda", show_mask=False):
     """
-    Estrae i keypoints predetti da una heatmap usando connected components + centroide.
+    Extract predicted keypoints from a heatmap using GPU binarization and CPU connected components.
 
     Parameters
     ----------
-    heatmap : torch.Tensor
-        Heatmap predetta di forma (1, H, W) o (H, W).
+    heatmap : torch.Tensor or np.ndarray
+        Predicted heatmap of shape (H, W) or (1, H, W).
     threshold : float
-        Valore di soglia per binarizzare la heatmap (default: 0.97).
+        Binarization threshold in [0,1]. If >1, it's scaled by heatmap max.
+    compute_cov : bool
+        If True, compute 2x2 covariance matrix for each component.
+    device : str
+        Device for GPU operations ('cuda' or 'cpu').
+    show_mask : bool
+        If True, show the binarized mask.
 
     Returns
     -------
-    list of lists
-        Lista di [x, y] float: centri delle "macchie" sopra soglia.
+    keypoints : list of tuples
+        Each element is ([cx, cy], cov) where cov is None if compute_cov=False.
     """
-    
-    # Preprocessing
-    # Se è un tensore PyTorch, converti
-    if isinstance(heatmap, torch.Tensor):
-        heatmap = heatmap.squeeze().cpu().numpy()
+
+    # Convert to torch tensor on GPU
+    if not isinstance(heatmap, torch.Tensor):
+        heatmap = torch.from_numpy(np.squeeze(heatmap)).to(device=device, dtype=torch.float32)
     else:
-        heatmap = np.squeeze(heatmap)
-    
-    if threshold is None:
-        threshold = heatmap.max()*0.97
-    else:
-        threshold *= heatmap.max()
-        
-    binary = (heatmap > threshold).astype(np.uint8)
-    
-    if show_mask is True:
+        heatmap = heatmap.squeeze().to(device=device, dtype=torch.float32)
+
+    # Threshold scaling
+    if threshold > 1.0:
+        threshold = threshold * heatmap.max()
+
+    # Binarize on GPU
+    binary_gpu = (heatmap > threshold).float()
+
+    # Move to CPU for connected components
+    binary = binary_gpu.cpu().numpy().astype(np.uint8)
+
+    if show_mask:
+        import matplotlib.pyplot as plt
         plt.imshow(binary, cmap='gray')
-        #plt.title("Binarized Heatmap")
         plt.axis('off')
         plt.show()
 
-    # Trova le componenti connesse (OpenCV)
+    # Connected components on CPU
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
 
     keypoints = []
-    for i in range(1, num_labels):
+    for i in range(1, num_labels):  # skip background
         cx, cy = centroids[i]
-        keypoint_coords = ([int(round(cx)), int(round(cy))])
+        centroid = [float(cx), float(cy)]
 
-        mask = (labels == i)
-        ys, xs = np.where(mask)
+        cov_matrix = None
+        if compute_cov:
+            mask = (labels == i)
+            ys, xs = np.where(mask)
+            if len(xs) >= 2:  # covariance requires at least 2 points
+                coords = np.stack([xs, ys], axis=1)  # shape (N,2)
+                cov_matrix = np.cov(coords, rowvar=False)
 
-        if len(xs) < 2:
-            # Covarianza mal definita con meno di 2 punti
-            continue
-
-        coords = np.stack([xs, ys], axis=1)  # forma (N, 2)
-        cov = np.cov(coords, rowvar=False)   # forma (2, 2)
-
-        keypoints.append((keypoint_coords, cov))
+        keypoints.append((centroid, cov_matrix))
 
     return keypoints
 
@@ -629,7 +639,7 @@ def power_sharpening(sigmoid_map, gamma=2.0, renormalize=False):
 
 
 
-def inference_image(img_path, model, device='cuda', show_mask=False, show_heatmap=True, threshold=None, npy=True, sigmoid=True, beta=2):
+def inference_image(img_path, model, device='cuda', show_mask=False, show_heatmap=True, threshold=None, npy=True, sigmoid=True, beta=1):
     """
     Esegue inferenza su un'immagine e restituisce heatmap + keypoints predetti.
 
@@ -789,7 +799,7 @@ def img_kp_pred_and_gr(keypoints_pred, keypoints_gt, img_path):
     plt.figure(figsize=(8, 8))
     plt.imshow(cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB))
     plt.axis('off')
-    plt.title("Predetti (verde) vs Ground Truth (blu)")
+    plt.title("UNet 800px")
     plt.show()
     
 
@@ -797,144 +807,188 @@ def img_kp_pred_and_gr(keypoints_pred, keypoints_gt, img_path):
 
 def inference_dataset(
     datapath,
-    output_path,
     model_path,
-    device='cuda',
+    output_path="output",
+    device="cuda",
     pixel_thresholds=[2, 4, 6],
     threshold=0.97,
-    show_mask=False,
     beta=1,
+    show_mask=False,
     save_images=False,
-    save_heatmaps=False
+    save_heatmaps=False,
+    x_interval=None,
+    y_interval=None
 ):
     """
-    Calcola le metriche PCK (precision, recall, F1) su un dataset di immagini + CSV GT.
+    Perform inference with a UNet model on a dataset (images + GT CSV) and compute metrics.
 
-    Parametri
-    ----------
-    datapath : str
-        Cartella principale che contiene 'images/train' e 'centers/train'.
-    model_path : str
-        Percorso al file .pt/.pth del modello U-Net salvato.
-    output_path : str
-        Cartella dove salvare risultati (immagini annotate, heatmap, metriche).
-    device : str
-        'cuda' o 'cpu'.
-    pixel_thresholds : list of int
-        Soglie PCK (in pixel).
-    attention_model : bool
-        Se True, usa UNetWithAttention, altrimenti usa UNet base.
-    threshold : float | None
-        Soglia di binarizzazione per la heatmap (es. 0.3 = 30% max).
-    show_mask : bool
-        Se True, mostra le maschere binarie a video.
+    Parameters:
+    - datapath (str): Main folder containing 'images/val' and 'centers/val'.
+    - model_path (str): Path to the saved UNet model (.pt/.pth).
+    - output_path (str): Directory for saving annotated images, heatmaps, and metrics.
+    - device (str): 'cuda' or 'cpu'.
+    - pixel_thresholds (list of int): Pixel thresholds for PCK evaluation.
+    - threshold (float): Binarization threshold for the heatmap.
+    - beta (float): Scaling parameter for Gaussian/softmax post-processing.
+    - show_mask (bool): If True, display binary masks.
+    - save_images (bool): If True, save predicted keypoints overlayed on input images.
+    - save_heatmaps (bool): If True, save predicted heatmaps.
+    - x_interval, y_interval (tuple | None): If None, defaults to central (1/4, 3/4) region.
 
-    Returns
-    -------
-    dict
-        Contiene 'precision', 'recall', 'f1', 'stdmean_f1', 'inference_time' come liste o float.
+    Returns:
+    - dict with averages and statistics:
+        precision, recall, f1, std_f1, stdmean_f1,
+        inference_time, std_time,
+        mean/std predicted keypoints per image,
+        metrics for centered and peripheral regions.
     """
-
     os.makedirs(output_path, exist_ok=True)
-    output_keypoints_dir = os.path.join(output_path, 'keypoints')
-    output_heatmaps_dir = os.path.join(output_path, 'heatmaps')
+    output_keypoints_dir = os.path.join(output_path, "keypoints")
+    output_heatmaps_dir = os.path.join(output_path, "heatmaps")
     os.makedirs(output_keypoints_dir, exist_ok=True)
     os.makedirs(output_heatmaps_dir, exist_ok=True)
 
+    # Load model
     model = UNetWithAttention(in_channels=1, out_channels=1).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    img_dir = os.path.join(datapath, 'images', 'val')
-    csv_dir = os.path.join(datapath, 'centers', 'val')
+    img_dir = os.path.join(datapath, "images", "val")
+    csv_dir = os.path.join(datapath, "centers", "val")
 
     image_paths = sorted([
         os.path.join(img_dir, f) for f in os.listdir(img_dir)
-        if f.endswith('.png') or f.endswith('.npy')
+        if f.endswith(".png") or f.endswith(".npy")
     ])
 
-    all_precisions = np.zeros(len(pixel_thresholds))
-    all_recalls = np.zeros(len(pixel_thresholds))
-    all_f1s = np.zeros(len(pixel_thresholds))
-    all_f1_list = []  
-    inference_time_list = []
-    number_predictedKP = []
-    count = 0
+    # Accumulators
+    sum_prec, sum_rec, sum_f1 = [np.zeros(len(pixel_thresholds)) for _ in range(3)]
+    all_f1_list, inference_time_list, keypoints_count_list = [], [], []
+    all_red_precision, all_red_recall, all_red_f1 = [], [], []
+    all_peripheral_precision, all_peripheral_recall, all_peripheral_f1 = [], [], []
+    number_predictedKP_centered, number_gtKP_centered = [], []
+    number_predictedKP_peripheral, number_gtKP_peripheral = [], []
+
+    total_images = 0
 
     for img_path in image_paths:
         base_name = os.path.splitext(os.path.basename(img_path))[0]
-        csv_path = os.path.join(csv_dir, base_name + '_centers.csv')
+        csv_path = os.path.join(csv_dir, base_name + "_centers.csv")
         if not os.path.exists(csv_path):
             continue
 
+        # Ground truth + inference
         gt_points = load_keypoints_from_csv(csv_path)
-        heatmap, pred_points_and_cov, inference_time = inference_image(
-            img_path, model, device=device, threshold=threshold, show_mask=show_mask, beta=beta, show_heatmap=False
+        heatmap, pred_points_and_cov, inf_time = inference_image(
+            img_path, model, device=device, threshold=threshold,
+            show_mask=show_mask, beta=beta, show_heatmap=False
         )
         pred_points = [kp[0] for kp in pred_points_and_cov]
-        number_predictedKP.append(len(pred_points))
-        inference_time_list.append(inference_time)
-        precisions, recalls, f1s = compute_pck_metrics(
-            np.array(pred_points), np.array(gt_points), pixel_thresholds
-        )
-        all_precisions += np.array(precisions)
-        all_recalls += np.array(recalls)
-        all_f1s += np.array(f1s)
-        all_f1_list.append(f1s) 
-        count += 1
 
-        if save_images is True:
-            if img_path.endswith('.npy'):
+        # Store counts and times
+        keypoints_count_list.append(len(pred_points))
+        inference_time_list.append(inf_time)
+
+        if len(gt_points) == 0 and len(pred_points) == 0:
+            continue
+
+        prec, rec, f1 = map(np.array, compute_pck_metrics(pred_points, gt_points, pixel_thresholds))
+        sum_prec += prec
+        sum_rec += rec
+        sum_f1 += f1
+        all_f1_list.append(f1)
+        total_images += 1
+
+        # Central vs peripheral metrics
+        if x_interval is None and y_interval is None:
+            x_interval = (heatmap.shape[1] // 4, 3 * heatmap.shape[1] // 4)
+            y_interval = (heatmap.shape[0] // 4, 3 * heatmap.shape[0] // 4)
+        red_precision, red_recall, red_f1, n_pred_c, n_gt_c = restricted_pck_metrics(pred_points, gt_points, pixel_thresholds, x_interval, y_interval)
+        per_precision, per_recall, per_f1, n_pred_p, n_gt_p = peripheral_pck_metrics(pred_points, gt_points, pixel_thresholds, x_interval, y_interval)
+        all_red_precision.append(red_precision)
+        all_red_recall.append(red_recall)
+        all_red_f1.append(red_f1)
+        all_peripheral_precision.append(per_precision)
+        all_peripheral_recall.append(per_recall)
+        all_peripheral_f1.append(per_f1)
+        number_predictedKP_centered.append(n_pred_c)
+        number_gtKP_centered.append(n_gt_c)
+        number_predictedKP_peripheral.append(n_pred_p)
+        number_gtKP_peripheral.append(n_gt_p)
+
+        # Save outputs
+        if save_images:
+            if img_path.endswith(".npy"):
                 img = np.load(img_path).astype(np.float32)
                 if img.max() <= 1.0:
                     img = (img * 255).astype(np.uint8)
                 img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             else:
                 img_color = cv2.imread(img_path, cv2.IMREAD_COLOR)
-
             for (x, y) in gt_points:
                 cv2.circle(img_color, (int(x), int(y)), 2, (255, 0, 0), -1)
             for (x, y) in pred_points:
                 cv2.circle(img_color, (int(x), int(y)), 1, (0, 255, 0), -1)
+            cv2.imwrite(os.path.join(output_keypoints_dir, base_name + "_pred.png"), img_color)
 
-            text = f"P: {precisions[1]:.2f}  R: {recalls[1]:.2f}  F1: {f1s[1]:.2f} | thr={pixel_thresholds[1]}px"
-            cv2.putText(img_color, text, (10, 20),
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                        fontScale=0.4,
-                        color=(255, 255, 255),
-                        thickness=1,
-                        lineType=cv2.LINE_AA)
-
-            cv2.imwrite(os.path.join(output_keypoints_dir, base_name + '_pred.png'), img_color)
-        
-        if save_heatmaps is True:    
+        if save_heatmaps:
             heatmap_norm = (np.clip(heatmap, 0, 1) * 255).astype(np.uint8)
-            cv2.imwrite(os.path.join(output_heatmaps_dir, base_name + '_heatmap.png'), heatmap_norm)
+            cv2.imwrite(os.path.join(output_heatmaps_dir, base_name + "_heatmap.png"), heatmap_norm)
 
-    if count == 0:
-        raise ValueError("Nessuna immagine valida trovata (nessun CSV corrispondente).")
+    if total_images == 0:
+        raise ValueError("No valid images found (missing corresponding CSV).")
 
-    all_f1_array = np.array(all_f1_list)  # (N immagini, len(pixel_thresholds))
-    mean_precisions = (all_precisions / count).tolist()
-    mean_recalls = (all_recalls / count).tolist()
-    mean_f1s = (all_f1s / count).tolist()
-    std_f1 = np.std(all_f1_array, axis=0).tolist()
-    stdmean_f1 = (np.std(all_f1_array, axis=0) / np.sqrt(count)).tolist()
-    
-    inference_time_list = np.array(inference_time_list)
-    number_predictedKP = np.array(number_predictedKP)
+    # Means and stds
+    mean_prec = sum_prec / total_images
+    mean_rec = sum_rec / total_images
+    mean_f1 = sum_f1 / total_images
+    all_f1_array = np.array(all_f1_list)
+    std_f1 = np.std(all_f1_array, axis=0)
+    stdmean_f1 = std_f1 / np.sqrt(total_images)
+    avg_time = np.mean(inference_time_list)
+    std_time = np.std(inference_time_list) / np.sqrt(total_images)
+    avg_kpts = np.mean(keypoints_count_list)
+    std_kpts = np.std(keypoints_count_list) / np.sqrt(total_images)
+
+    mean_red_precision = (np.mean(all_red_precision, axis=0)).tolist() if all_red_precision else None 
+    mean_red_recall = (np.mean(all_red_recall, axis=0)).tolist() if all_red_recall else None
+    mean_red_f1 = (np.mean(all_red_f1, axis=0)).tolist() if all_red_f1 else None
+    mean_number_predKP_centered = np.mean(number_predictedKP_centered) if number_predictedKP_centered else None
+    mean_number_gtKP_centered = np.mean(number_gtKP_centered) if number_gtKP_centered else None
+
+    mean_per_precision = (np.mean(all_peripheral_precision, axis=0)).tolist() if all_peripheral_precision else None
+    mean_per_recall = (np.mean(all_peripheral_recall, axis=0)).tolist() if all_peripheral_recall else None
+    mean_per_f1 = (np.mean(all_peripheral_f1, axis=0)).tolist() if all_peripheral_f1 else None
+    mean_number_predKP_peripheral = np.mean(number_predictedKP_peripheral) if number_predictedKP_peripheral else None
+    mean_number_gtKP_peripheral = np.mean(number_gtKP_peripheral) if number_gtKP_peripheral else None
+
+    print(f"\n== Average results over {total_images} images ==")
+    for i, t in enumerate(pixel_thresholds):
+        print(f"Threshold {t:.1f}px ==> Precision: {mean_prec[i]:.3f} | Recall: {mean_rec[i]:.3f} | F1: {mean_f1[i]:.3f}")
+    print(f"Inference time: ( {avg_time*1000:.3f} ± {std_time*1000:.3f} ) ms/image")
+    print(f"Predicted keypoints: ( {avg_kpts:.2f} ± {std_kpts:.2f} ) per image")
 
     return {
-        'precision': mean_precisions,
-        'recall': mean_recalls,
-        'f1': mean_f1s,
-        'std_f1': std_f1,
-        'stdmean_f1': stdmean_f1,
-        'inference_time_array': inference_time_list,
-        'inference_time': np.mean(inference_time_list),
-        'std_time': np.std(inference_time_list)/np.sqrt(len(inference_time_list)),
-        'mean_number_predictedKP': np.mean(number_predictedKP),
-        'std_number_predictedKP': np.std(number_predictedKP)/np.sqrt(len(number_predictedKP))
+        "thresholds": pixel_thresholds,
+        "precision": mean_prec.tolist(),
+        "recall": mean_rec.tolist(),
+        "f1": mean_f1.tolist(),
+        "std_f1": std_f1.tolist(),
+        "stdmean_f1": stdmean_f1.tolist(),
+        "avg_inference_time_sec": avg_time,
+        "std_inference_time_sec": std_time,
+        "avg_pred_keypoints": avg_kpts,
+        "std_pred_keypoints": std_kpts,
+        "mean_red_precision": mean_red_precision,
+        "mean_red_recall": mean_red_recall,
+        "mean_red_f1": mean_red_f1,
+        "mean_number_predKP_centered": mean_number_predKP_centered,
+        "mean_number_gtKP_centered": mean_number_gtKP_centered,
+        "mean_per_precision": mean_per_precision,
+        "mean_per_recall": mean_per_recall,
+        "mean_per_f1": mean_per_f1,
+        "mean_number_predKP_peripheral": mean_number_predKP_peripheral,
+        "mean_number_gtKP_peripheral": mean_number_gtKP_peripheral
     }
     
     
@@ -1097,4 +1151,359 @@ def plot_F1_surface(pck_thresholds, binary_thresholds, F1_matrix, save_img):
     if save_img:
         plt.savefig('F1_surface_plot.png')
     
+    plt.show()
+
+
+def restricted_pck_metrics(pred_kp, gt_kp, thresholds, x_interval, y_interval):
+    # seleziono i kp al centro dell'immagine
+    pred_kp_centered = [kp for kp in pred_kp if x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1]]
+    gt_kp_centered = [kp for kp in gt_kp if x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1]]
+    precision, recall, f1 = compute_pck_metrics(pred_kp_centered, gt_kp_centered, thresholds)
+    number_pred_kp_centered = len(pred_kp_centered)
+    number_gt_kp_centered = len(gt_kp_centered)
+    return precision, recall, f1, number_pred_kp_centered, number_gt_kp_centered
+
+def peripheral_pck_metrics(pred_kp, gt_kp, thresholds, x_interval, y_interval):
+    # seleziono i kp esterni al centro dell'immagine
+    pred_kp_peripheral = [kp for kp in pred_kp if not (x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1])]
+    gt_kp_peripheral = [kp for kp in gt_kp if not (x_interval[0] <= kp[0] <= x_interval[1] and y_interval[0] <= kp[1] <= y_interval[1])]
+    precision, recall, f1 = compute_pck_metrics(pred_kp_peripheral, gt_kp_peripheral, thresholds)
+    number_pred_kp_peripheral = len(pred_kp_peripheral)
+    number_gt_kp_peripheral = len(gt_kp_peripheral)
+    return precision, recall, f1, number_pred_kp_peripheral, number_gt_kp_peripheral
+
+
+
+
+
+def extract_predicted_keypoints_gpu(heatmap, threshold=0.5, device="cuda", compute_cov=False):
+    """
+    Extract keypoints from a heatmap tensor on GPU using Kornia connected components.
+    
+    Parameters
+    ----------
+    heatmap : torch.Tensor
+        Input heatmap (H, W) on GPU.
+    threshold : float
+        Binarization threshold.
+    device : str
+        Device to use ('cuda' or 'cpu').
+    compute_cov : bool
+        If True, compute 2x2 covariance matrix for each connected component.
+        If False, only centroid is returned (faster).
+    
+    Returns
+    -------
+    keypoints : list of tuples
+        List of tuples:
+        - If compute_cov=False: ([cx, cy], None)
+        - If compute_cov=True: ([cx, cy], covariance 2x2 numpy array)
+    """
+    
+    # Ensure float32 tensor on device
+    heatmap = heatmap.to(device=device, dtype=torch.float32)
+
+    # Binarize heatmap on GPU
+    binary = (heatmap > threshold).to(torch.float32)  # float32 for Kornia
+    binary_bchw = binary.unsqueeze(0).unsqueeze(0)    # (1,1,H,W)
+
+    # Connected components on GPU
+    labels = kc.connected_components(binary_bchw)    # (1,1,H,W)
+    labels = labels.squeeze(0).squeeze(0)            # (H, W)
+
+    num_labels = int(labels.max().item()) + 1  # include background=0
+
+    keypoints = []
+    for lbl in range(1, num_labels):  # skip background
+        mask = (labels == lbl)
+
+        if mask.sum() < 2:  # skip tiny components
+            continue
+
+        # Get coordinates of pixels in the component
+        ys, xs = torch.nonzero(mask, as_tuple=True)
+
+        # Centroid = mean of coordinates
+        cx = xs.float().mean()
+        cy = ys.float().mean()
+        centroid = [cx.item(), cy.item()]
+
+        cov_matrix = None
+        if compute_cov:
+            # Covariance of coordinates (2x2)
+            coords = torch.stack([xs.float(), ys.float()], dim=1)  # (N, 2)
+            cov_matrix = torch.cov(coords.T).cpu().numpy()
+
+        keypoints.append((centroid, cov_matrix))
+
+    return keypoints
+
+
+
+
+
+
+def inference_image_gpu(img, model, device="cuda", show_heatmap=True, show_mask=False,
+                        threshold=None, sigmoid=True, beta=1.0):
+    """
+    Inferenza su immagine (numpy o torch) restando su GPU, restituisce heatmap + keypoints.
+    """
+    # 1. Converto immagine in torch [1,1,H,W]
+    if isinstance(img, torch.Tensor):
+        img_tensor = img.to(torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+    else:
+        img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    # 2. Forward pass
+    model = model.to(device).eval()
+    start_time = time.time()
+    with torch.no_grad():
+        output = model(img_tensor)  # [1,1,H,W]
+        if sigmoid:
+            output = torch.sigmoid(output)
+            # output = power_sharpening(output, gamma=beta, renormalize=False)
+
+    heatmap_pred = output.squeeze(0).squeeze(0)  # (H,W) su GPU
+
+    # 3. Keypoints extraction su GPU
+    keypoints = extract_predicted_keypoints_gpu(
+        heatmap_pred,
+        threshold=threshold,
+        device=device
+    )
+    inference_time = time.time() - start_time
+
+    # 4. Show heatmap solo se richiesto (serve CPU)
+    if show_heatmap:
+        plt.imshow(heatmap_pred.detach().cpu().numpy(), cmap="viridis")
+        plt.axis("off")
+        plt.show()
+
+    return heatmap_pred, keypoints, inference_time
+
+
+def inference_dataset_gpu(
+    datapath,
+    model_path,
+    output_path="output",
+    device="cuda",
+    pixel_thresholds=[2, 4, 6],
+    threshold=0.97,
+    beta=1,
+    show_mask=False,
+    save_images=False,
+    save_heatmaps=False,
+    x_interval=None,
+    y_interval=None
+):
+    """
+    Perform inference with a UNet model on a dataset (images + GT CSV) and compute metrics (GPU version).
+    """
+
+    os.makedirs(output_path, exist_ok=True)
+    output_keypoints_dir = os.path.join(output_path, "keypoints")
+    output_heatmaps_dir = os.path.join(output_path, "heatmaps")
+    os.makedirs(output_keypoints_dir, exist_ok=True)
+    os.makedirs(output_heatmaps_dir, exist_ok=True)
+
+    # Load model
+    model = UNetWithAttention(in_channels=1, out_channels=1).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    img_dir = os.path.join(datapath, "images", "val")
+    csv_dir = os.path.join(datapath, "centers", "val")
+
+    image_paths = sorted([
+        os.path.join(img_dir, f) for f in os.listdir(img_dir)
+        if f.endswith(".png") or f.endswith(".npy")
+    ])
+
+    # Accumulators
+    sum_prec, sum_rec, sum_f1 = [np.zeros(len(pixel_thresholds)) for _ in range(3)]
+    all_f1_list, inference_time_list, keypoints_count_list = [], [], []
+    all_red_precision, all_red_recall, all_red_f1 = [], [], []
+    all_peripheral_precision, all_peripheral_recall, all_peripheral_f1 = [], [], []
+    number_predictedKP_centered, number_gtKP_centered = [], []
+    number_predictedKP_peripheral, number_gtKP_peripheral = [], []
+
+    total_images = 0
+
+    for img_path in image_paths:
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        csv_path = os.path.join(csv_dir, base_name + "_centers.csv")
+        if not os.path.exists(csv_path):
+            continue
+
+        # Ground truth (rimane numpy/CPU perché è CSV)
+        gt_points = load_keypoints_from_csv(csv_path)
+
+        # Inference su GPU
+        if img_path.endswith(".npy"):
+            img = np.load(img_path).astype(np.float32)
+        else:
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+
+        heatmap, pred_points_and_cov, inf_time = inference_image_gpu(
+            img, model, device=device, threshold=threshold,
+            beta=beta, show_heatmap=False
+        )
+
+        # Converti keypoints CUDA → Python list per le metriche
+        pred_points = [kp[0] for kp in pred_points_and_cov]
+
+        # Store counts and times
+        keypoints_count_list.append(len(pred_points))
+        inference_time_list.append(inf_time)
+
+        if len(gt_points) == 0 and len(pred_points) == 0:
+            continue
+
+        prec, rec, f1 = map(np.array, compute_pck_metrics(pred_points, gt_points, pixel_thresholds))
+        sum_prec += prec
+        sum_rec += rec
+        sum_f1 += f1
+        all_f1_list.append(f1)
+        total_images += 1
+
+        # Central vs peripheral metrics
+        if x_interval is None and y_interval is None:
+            H, W = heatmap.shape
+            x_interval = (W // 4, 3 * W // 4)
+            y_interval = (H // 4, 3 * H // 4)
+
+        red_precision, red_recall, red_f1, n_pred_c, n_gt_c = restricted_pck_metrics(
+            pred_points, gt_points, pixel_thresholds, x_interval, y_interval
+        )
+        per_precision, per_recall, per_f1, n_pred_p, n_gt_p = peripheral_pck_metrics(
+            pred_points, gt_points, pixel_thresholds, x_interval, y_interval
+        )
+
+        all_red_precision.append(red_precision)
+        all_red_recall.append(red_recall)
+        all_red_f1.append(red_f1)
+        all_peripheral_precision.append(per_precision)
+        all_peripheral_recall.append(per_recall)
+        all_peripheral_f1.append(per_f1)
+        number_predictedKP_centered.append(n_pred_c)
+        number_gtKP_centered.append(n_gt_c)
+        number_predictedKP_peripheral.append(n_pred_p)
+        number_gtKP_peripheral.append(n_gt_p)
+
+        # Save outputs (CPU perché OpenCV vuole numpy)
+        if save_images:
+            if img_path.endswith(".npy"):
+                img = np.load(img_path).astype(np.float32)
+                if img.max() <= 1.0:
+                    img = (img * 255).astype(np.uint8)
+                img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            else:
+                img_color = cv2.imread(img_path, cv2.IMREAD_COLOR)
+
+            for (x, y) in gt_points:
+                cv2.circle(img_color, (int(x), int(y)), 2, (255, 0, 0), -1)
+            for (x, y) in pred_points:
+                cv2.circle(img_color, (int(x), int(y)), 1, (0, 255, 0), -1)
+            cv2.imwrite(os.path.join(output_keypoints_dir, base_name + "_pred.png"), img_color)
+
+        if save_heatmaps:
+            heatmap_norm = (heatmap.detach().cpu().numpy() * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(output_heatmaps_dir, base_name + "_heatmap.png"), heatmap_norm)
+
+    if total_images == 0:
+        raise ValueError("No valid images found (missing corresponding CSV).")
+
+    # Means and stds
+    mean_prec = sum_prec / total_images
+    mean_rec = sum_rec / total_images
+    mean_f1 = sum_f1 / total_images
+    all_f1_array = np.array(all_f1_list)
+    std_f1 = np.std(all_f1_array, axis=0)
+    stdmean_f1 = std_f1 / np.sqrt(total_images)
+    avg_time = np.mean(inference_time_list)
+    std_time = np.std(inference_time_list) / np.sqrt(total_images)
+    avg_kpts = np.mean(keypoints_count_list)
+    std_kpts = np.std(keypoints_count_list) / np.sqrt(total_images)
+
+    mean_red_precision = (np.mean(all_red_precision, axis=0)).tolist() if all_red_precision else None 
+    mean_red_recall = (np.mean(all_red_recall, axis=0)).tolist() if all_red_recall else None
+    mean_red_f1 = (np.mean(all_red_f1, axis=0)).tolist() if all_red_f1 else None
+    mean_number_predKP_centered = np.mean(number_predictedKP_centered) if number_predictedKP_centered else None
+    mean_number_gtKP_centered = np.mean(number_gtKP_centered) if number_gtKP_centered else None
+
+    mean_per_precision = (np.mean(all_peripheral_precision, axis=0)).tolist() if all_peripheral_precision else None
+    mean_per_recall = (np.mean(all_peripheral_recall, axis=0)).tolist() if all_peripheral_recall else None
+    mean_per_f1 = (np.mean(all_peripheral_f1, axis=0)).tolist() if all_peripheral_f1 else None
+    mean_number_predKP_peripheral = np.mean(number_predictedKP_peripheral) if number_predictedKP_peripheral else None
+    mean_number_gtKP_peripheral = np.mean(number_gtKP_peripheral) if number_gtKP_peripheral else None
+
+    print(f"\n== Average results over {total_images} images ==")
+    for i, t in enumerate(pixel_thresholds):
+        print(f"Threshold {t:.1f}px ==> Precision: {mean_prec[i]:.3f} | Recall: {mean_rec[i]:.3f} | F1: {mean_f1[i]:.3f}")
+    print(f"Inference time: ( {avg_time*1000:.3f} ± {std_time*1000:.3f} ) ms/image")
+    print(f"Predicted keypoints: ( {avg_kpts:.2f} ± {std_kpts:.2f} ) per image")
+
+    return {
+        "thresholds": pixel_thresholds,
+        "precision": mean_prec.tolist(),
+        "recall": mean_rec.tolist(),
+        "f1": mean_f1.tolist(),
+        "std_f1": std_f1.tolist(),
+        "stdmean_f1": stdmean_f1.tolist(),
+        "avg_inference_time_sec": avg_time,
+        "std_inference_time_sec": std_time,
+        "avg_pred_keypoints": avg_kpts,
+        "std_pred_keypoints": std_kpts,
+        "mean_red_precision": mean_red_precision,
+        "mean_red_recall": mean_red_recall,
+        "mean_red_f1": mean_red_f1,
+        "mean_number_predKP_centered": mean_number_predKP_centered,
+        "mean_number_gtKP_centered": mean_number_gtKP_centered,
+        "mean_per_precision": mean_per_precision,
+        "mean_per_recall": mean_per_recall,
+        "mean_per_f1": mean_per_f1,
+        "mean_number_predKP_peripheral": mean_number_predKP_peripheral,
+        "mean_number_gtKP_peripheral": mean_number_gtKP_peripheral
+    }
+
+
+def img_kp_pred_and_gr_new(keypoints_pred, keypoints_gt, img_path, title="Immagine con keypoints"):
+    """
+    Mostra immagine .npy con pixel sopra soglia evidenziati
+    e keypoints ground truth (rosso) e predetti (verde).
+    
+    Args:
+        keypoints_pred (list of tuple | None): lista di (x, y) predetti (può essere None o vuota)
+        keypoints_gt (list of tuple | None): lista di (x, y) ground truth (può essere None o vuota)
+        img_path (str): percorso del file .npy immagine
+        title (str): titolo del plot
+    """
+    # Carico immagine
+    img = np.load(img_path)
+
+    # Creo maschera binaria: 1 se sopra soglia, NaN altrimenti
+    mask = np.where(img > 0.00000000000001, 1, np.nan)
+
+    # Colormap: sfondo grigio chiaro semitrasparente, pixel in nero
+    cmap = ListedColormap(['lightgray', 'black'])
+    cmap.set_bad(color='lightgray', alpha=0.4)
+
+    # Mostro immagine
+    plt.figure(figsize=(8, 8))
+    plt.imshow(mask, cmap=cmap, vmin=0, vmax=1, interpolation='nearest')
+
+    # Disegno GT (ROSSO con bordo bianco)
+    if keypoints_gt is not None and len(keypoints_gt) > 0:
+        for (x, y) in keypoints_gt:
+            plt.plot(x, y, 'o', markersize=5,
+                     markeredgewidth=0.5, markeredgecolor='white', color='deepskyblue')
+
+    # Disegno Predetti (VERDE con bordo bianco)
+    if keypoints_pred is not None and len(keypoints_pred) > 0:
+        for (x, y) in keypoints_pred:
+            plt.plot(x, y, 'o', markersize=2,
+                    color='red')
+
+    plt.axis('off')
+    plt.title(title)
     plt.show()
