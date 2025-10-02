@@ -7,9 +7,12 @@
 !KeyPoint_Detection/**
 !UNet/
 !UNet/**
+!YOLO/
+!YOLO/**
 
 # Eccezioni delle eccezioni ;)
 KeyPoint_Detection/YOLO_dataset/
+YOLO/YOLO_dataset/
 UNet/UNet_dataset/
 UNet/Models/Model_20000_5000_160_180/output_inference
 UNet/Models/Model_92000_8000_160_180/output_inference
